@@ -1,0 +1,9 @@
+{
+  "fields": {
+    "payer_facility_name": "〇〇調剤薬局",
+    "prescribing_facility_name": "△△内科クリニック",
+    "payment_date": "2026-02-22",
+    "payment_amount": 1840
+  }
+}
+

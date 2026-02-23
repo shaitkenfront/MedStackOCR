@@ -1,0 +1,29 @@
+# Python cache / tooling
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Local cloned third-party repositories
+external/
+
+# Generated outputs (keep only example for review flow)
+data/outputs/**
+!data/outputs/
+!data/outputs/review_fix.example.json
+
+# Large local resources
+data/tessdata/*.traineddata
+data/samples/
+
+# OS generated files
+.DS_Store
+Thumbs.db
