@@ -70,12 +70,13 @@ class DecisionResolver:
             FieldName.PRESCRIBING_FACILITY_NAME: None,
             FieldName.PAYMENT_DATE: None,
             FieldName.PAYMENT_AMOUNT: None,
+            FieldName.FAMILY_MEMBER_NAME: None,
         }
 
         for field_name, candidates in pool.items():
             if not candidates:
                 continue
-            best = sorted(candidates, key=lambda c: c.score, reverse=True)[0]
+            best = sorted(candidates, key=lambda c: (c.score, c.ocr_confidence), reverse=True)[0]
             threshold = self.candidate_threshold
             if best.source == "template":
                 threshold -= 0.7
@@ -91,4 +92,3 @@ def resolver_from_config(config: dict[str, Any]) -> DecisionResolver:
         reject_threshold=float(pipeline.get("reject_threshold", 0.35)),
         candidate_threshold=float(pipeline.get("candidate_threshold", 2.5)),
     )
-

@@ -6,11 +6,12 @@ from typing import Any
 
 from audit.logger import AuditLogger
 from classify.document_classifier import DocumentClassifier
-from core.enums import FieldName
-from core.models import Candidate, ExtractionResult, TemplateMatch
+from core.enums import DecisionStatus, FieldName
+from core.models import Candidate, Decision, ExtractionResult, TemplateMatch
 from extractors.amount_extractor import AmountExtractor
 from extractors.date_extractor import DateExtractor
 from extractors.facility_extractor import FacilityExtractor
+from extractors.family_name_extractor import FamilyNameExtractor
 from io_utils.image_loader import get_image_size
 from ocr.factory import create_ocr_adapter
 from ocr.normalizer import OCRNormalizer
@@ -32,6 +33,7 @@ class ReceiptExtractionPipeline:
         self.facility_extractor = FacilityExtractor()
         self.date_extractor = DateExtractor()
         self.amount_extractor = AmountExtractor()
+        self.family_name_extractor = FamilyNameExtractor(config.get("family_registry"))
         self.resolver = resolver_from_config(config)
         self.normalizer = OCRNormalizer()
         self.audit_logger = AuditLogger()
@@ -57,10 +59,12 @@ class ReceiptExtractionPipeline:
             FieldName.PRESCRIBING_FACILITY_NAME: [],
             FieldName.PAYMENT_DATE: [],
             FieldName.PAYMENT_AMOUNT: [],
+            FieldName.FAMILY_MEMBER_NAME: [],
         }
         self._merge_candidate_pool(candidate_pool, self.facility_extractor.extract(document_type, lines))
         candidate_pool[FieldName.PAYMENT_DATE].extend(self.date_extractor.extract(lines))
         candidate_pool[FieldName.PAYMENT_AMOUNT].extend(self.amount_extractor.extract(lines))
+        candidate_pool[FieldName.FAMILY_MEMBER_NAME].extend(self.family_name_extractor.extract(lines))
 
         if matched_template is not None:
             template_candidates = self.template_matcher.apply_template(matched_template, lines)
@@ -74,6 +78,7 @@ class ReceiptExtractionPipeline:
             template_match=template_match,
             ocr_quality=ocr_quality,
         )
+        decision = self._apply_family_policy(selected_fields, decision)
 
         audit = self.audit_logger.create(
             engine=raw.engine,
@@ -85,6 +90,15 @@ class ReceiptExtractionPipeline:
             audit.notes.append(f"template_applied:{template_match.template_family_id}")
         if not lines:
             audit.notes.append("ocr_lines_empty")
+        family_member = selected_fields.get(FieldName.FAMILY_MEMBER_NAME)
+        if family_member is None:
+            audit.notes.append("family_member_not_detected")
+        elif family_member.source == "family_registry":
+            audit.notes.append("family_member_registry_matched")
+        elif family_member.source == "family_registry_same_surname":
+            audit.notes.append("family_member_unregistered_same_surname")
+        elif family_member.source == "family_registry_unknown_surname":
+            audit.notes.append("family_member_unregistered_different_surname")
 
         document_id = self._build_document_id(image_path)
         result = ExtractionResult(
@@ -109,6 +123,28 @@ class ReceiptExtractionPipeline:
             if field_name not in target:
                 target[field_name] = []
             target[field_name].extend(candidates)
+
+    @staticmethod
+    def _apply_family_policy(
+        selected_fields: dict[str, Candidate | None],
+        decision: Decision,
+    ) -> Decision:
+        family_member = selected_fields.get(FieldName.FAMILY_MEMBER_NAME)
+        if family_member is None:
+            return decision
+
+        reasons = list(decision.reasons)
+        if family_member.source == "family_registry_unknown_surname":
+            if "family_name_not_in_registry_different_surname" not in reasons:
+                reasons.append("family_name_not_in_registry_different_surname")
+            return Decision(status=DecisionStatus.REJECTED, confidence=decision.confidence, reasons=reasons)
+
+        if family_member.source == "family_registry_same_surname" and decision.status != DecisionStatus.REJECTED:
+            if "family_name_not_in_registry_same_surname" not in reasons:
+                reasons.append("family_name_not_in_registry_same_surname")
+            return Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=decision.confidence, reasons=reasons)
+
+        return decision
 
     @staticmethod
     def _build_document_id(image_path: str) -> str:

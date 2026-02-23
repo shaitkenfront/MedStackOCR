@@ -1,12 +1,10 @@
 # MedStackOCR MVP
 
-`PLAN.md` に基づく、医療費控除向け領収書抽出エンジンの MVP 実装です。
+医療費控除向け領収書抽出エンジンの MVP 実装です。
 
 ## 主要機能
-- OCR 抽象化（`mock` / `tesseract` / `paddle` / `yomitoku` / `deepseek`）
-- OCR 正規化（`OCRLine` 共通化）
-- 帳票分類（`pharmacy` / `clinic_or_hospital` / `unknown`）
 - 施設名・日付・金額抽出
+- 家族氏名抽出（家族辞書 + alias 対応）
 - Resolver による `AUTO_ACCEPT` / `REVIEW_REQUIRED` / `REJECTED`
 - 監査情報出力（根拠 `reasons` を保持）
 - 世帯ローカルテンプレート（保存・一致・学習）
@@ -18,22 +16,55 @@
 pip install -r requirements-ocr-optional.txt
 ```
 
+公開運用の推奨:
+- `config.example.yaml` をコピーして `config.yaml` を作成し、家族氏名・APIキー等をローカルで設定
+- `config.yaml` / `data/templates/` は `.gitignore` 対象（個人情報・学習済みテンプレートの混入防止）
+
+`config.yaml` 既定では `ocr.allowed_engines: [yomitoku]` のため、`--ocr-engine` に他エンジンを指定するとエラーになります。
+`yomitoku` は、CUDA が使えない環境では自動で CPU にフォールバックします。強制的に CPU 実行したい場合は `--force-cpu` を指定してください。
+
+`family_registry` は必須です。`members` に家族氏名（`canonical_name`）と OCR 揺れ向けの `aliases` を登録してください。
+未登録氏名を検出した場合は以下で判定します。
+- 同姓: `REVIEW_REQUIRED`
+- 異姓: `REJECTED`
+
+テンプレートと運用手順:
+- `family_registry.template.yaml`
+- `docs/family_registry_guide.md`
+
+年整合チェック（`batch` 実行時）:
+- `pipeline.target_tax_year` を指定した場合: `payment_date.year` が一致しない明細を `REVIEW_REQUIRED`
+- 未指定の場合: 同一バッチ内で最多年（重み付き多数決）を推定し、外れ年を `REVIEW_REQUIRED`
+- 設定は `pipeline.year_consistency`（`enabled`, `min_samples`, `dominant_ratio_threshold`, `weight_by_confidence`）
+
+`batch` の出力:
+- `summary.json`: 当回実行の処理結果（`SKIPPED_ALREADY_PROCESSED` を含む）
+- `summary.csv`: 全 `*.result.json` から再生成する4項目サマリ（`日付`,`氏名`,`医療機関・調剤薬局名`,`金額`）
+- `processed_files.json`: 処理済み画像の管理ファイル（サイズ + 更新時刻）
+  - 2回目以降は `processed_files.json` と一致する画像をスキップし、未処理ファイルのみ実行
+- `--target-dir`: 入力画像（`*.jpg` など）と出力ファイル（`*.result.json`, `summary.*`）を同じフォルダで管理
+
 ```bash
 python -m app.main extract \
   --config config.yaml \
   --image data/samples/pharmacy_receipt.jpg \
   --household-id household_demo \
-  --ocr-engine mock \
+  --force-cpu \
   --output data/outputs/pharmacy_result.json
 ```
 
 ```bash
 python -m app.main batch \
   --config config.yaml \
-  --input-dir data/samples \
   --household-id household_demo \
-  --ocr-engine mock \
-  --output-dir data/outputs
+  --force-cpu \
+  --target-dir data/samples
+```
+
+```bash
+python -m app.main refresh-summary \
+  --config config.yaml \
+  --target-dir data/outputs/yomitoku_tuned
 ```
 
 ```bash
@@ -41,14 +72,16 @@ python -m app.main compare-ocr \
   --config config.yaml \
   --image data/samples/pharmacy_receipt.jpg \
   --household-id household_demo \
-  --ocr-engines mock,tesseract,paddle,yomitoku,deepseek \
-  --output-dir data/outputs/compare
+  --ocr-engines yomitoku \
+  --force-cpu \
+  --target-dir data/outputs/compare
 ```
 
 ```bash
 python -m app.main healthcheck-ocr \
   --config config.yaml \
-  --ocr-engines mock,tesseract,paddle,yomitoku,deepseek
+  --ocr-engines yomitoku \
+  --force-cpu
 ```
 
 ```bash
@@ -99,6 +132,8 @@ ocr:
 以下の固定構成で動作確認済み（CPU実行）:
 - `paddlepaddle==3.2.2`
 - `paddleocr==3.3.3`
+
+※この検証を行う場合は、一時的に `config.yaml` の `ocr.allowed_engines` に `paddle` を追加してください。
 
 ```bash
 D:\\ProgramData\\Anaconda\\python.exe -m venv .venv-py312-paddle
