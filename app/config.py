@@ -8,11 +8,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "review_threshold": 0.72,
         "reject_threshold": 0.35,
         "candidate_threshold": 2.5,
+        "target_tax_year": None,
+        "year_consistency": {
+            "enabled": True,
+            "min_samples": 5,
+            "dominant_ratio_threshold": 0.65,
+            "weight_by_confidence": True,
+        },
     },
     "ocr": {
-        "engine": "mock",
+        "engine": "yomitoku",
+        "allowed_engines": ["yomitoku"],
         "engines": {
-            "mock": {"enabled": True},
+            "mock": {"enabled": False},
             "tesseract": {
                 "enabled": False,
                 "lang": "jpn+eng",
@@ -26,7 +34,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "ocr_version": None,
             },
             "yomitoku": {
-                "enabled": False,
+                "enabled": True,
                 "device": "cuda",
                 "visualize": False,
             },
@@ -56,6 +64,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "templates": {
         "store_path": "data/templates",
         "household_match_threshold": 0.65,
+    },
+    "family_registry": {
+        "required": True,
+        "members": [
+            {
+                "canonical_name": "山田 太郎",
+                "aliases": ["山田太郎", "山田 太郎様", "ヤマダ タロウ", "ヤマタ タロウ"],
+            },
+            {
+                "canonical_name": "山田 花子",
+                "aliases": ["山田花子", "山田 花子様", "ヤマダ ハナコ", "ヤマタ ハナコ"],
+            },
+        ],
     },
     "output": {
         "save_audit": True,

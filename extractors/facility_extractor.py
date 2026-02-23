@@ -10,7 +10,34 @@ PHARMACY_KEYWORDS = ("薬局", "調剤", "ファーマシー", "保険薬局")
 CLINIC_KEYWORDS = ("病院", "医院", "クリニック", "診療所")
 PRESCRIBING_CONTEXT = ("処方箋", "保険医療機関", "交付", "医師")
 CONTACT_ANCHORS = ("〒", "TEL", "領収書", "発行")
-NON_NAME_HINTS = ("領収日", "発行日", "調剤日", "請求", "合計", "お支払", "税込", "税率", "点数")
+NON_NAME_HINTS = (
+    "領収日",
+    "発行日",
+    "調剤日",
+    "受診日",
+    "診療日",
+    "請求額",
+    "請求金額",
+    "請求書",
+    "合計",
+    "お支払",
+    "税込",
+    "税率",
+    "点数",
+    "負担割合",
+    "保険種類",
+    "保険適用",
+    "氏名",
+    "患者",
+    "生年月日",
+    "保険者番号",
+    "記号番号",
+    "明細書",
+    "領収書",
+    "領収証",
+    "調剤明細書",
+)
+NON_NAME_EXACT = {"調剤", "明細", "領収", "合計", "内訳"}
 
 RE_NAME_PREFIX = re.compile(
     r"^(処方箋交付医療機関|保険医療機関|医療機関名|病院名|医院名|薬局名|調剤薬局名)\s*[:：]?\s*"
@@ -142,17 +169,23 @@ class FacilityExtractor:
         text = line.text
 
         if is_top_region(line.bbox, ratio=0.25):
-            score += 3.0
+            score += 1.6
             reasons.append("top_region_bonus")
         if contains_any(text, CLINIC_KEYWORDS):
-            score += 2.0
+            score += 3.6
             reasons.append("contains_clinic_keyword")
+        if "医療法人" in text:
+            score += 0.8
+            reasons.append("contains_medical_corporation_keyword")
         if self._near_any(line, contact_lines):
-            score += 1.0
+            score += 0.8
             reasons.append("near_contact_anchor")
         if contains_any(text, PRESCRIBING_CONTEXT):
             score -= 2.0
             reasons.append("prescribing_context_penalty")
+        if cleaned_text.endswith(("様", "殿")):
+            score -= 3.0
+            reasons.append("patient_honorific_penalty")
         if score < 1.0:
             return None
 
@@ -206,13 +239,24 @@ class FacilityExtractor:
     @staticmethod
     def _looks_like_name(text: str) -> bool:
         t = normalize_spaces(text)
+        compact = re.sub(r"\s+", "", t)
         if not t:
             return False
-        if t.startswith("〒") or t.upper().startswith("TEL"):
+        upper_t = t.upper()
+        if t.startswith("〒") or upper_t.startswith("TEL") or "FAX" in upper_t:
             return False
         if len(t) < 2 or len(t) > 64:
             return False
         if any(key in t for key in NON_NAME_HINTS):
+            return False
+        compact_hints = tuple(key.replace(" ", "") for key in NON_NAME_HINTS)
+        if any(key in compact for key in compact_hints):
+            return False
+        if compact in NON_NAME_EXACT:
+            return False
+        if compact.endswith(("様", "殿")):
+            return False
+        if ":" in t and not contains_any(t, PHARMACY_KEYWORDS + CLINIC_KEYWORDS):
             return False
         digits = count_digits(t)
         if digits and digits / max(1, len(t)) > 0.35:
@@ -225,4 +269,3 @@ class FacilityExtractor:
         cleaned = RE_NAME_PREFIX.sub("", cleaned)
         cleaned = cleaned.strip(" :：")
         return cleaned
-

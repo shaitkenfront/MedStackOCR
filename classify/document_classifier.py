@@ -9,6 +9,10 @@ PHARMACY_KEYWORDS = ("薬局", "調剤", "処方箋", "保険薬局", "ファー
 CLINIC_KEYWORDS = ("病院", "医院", "クリニック", "診療所")
 
 
+def _has_prescription_keyword(text: str) -> bool:
+    return "処方箋" in text and "処方箋料" not in text
+
+
 class DocumentClassifier:
     def classify(self, lines: list[OCRLine]) -> tuple[DocumentType, float, list[str], float]:
         if not lines:
@@ -22,7 +26,11 @@ class DocumentClassifier:
         for line in lines:
             text = line.text
             for kw in PHARMACY_KEYWORDS:
-                if kw in text:
+                if kw == "処方箋":
+                    matched = _has_prescription_keyword(text)
+                else:
+                    matched = kw in text
+                if matched:
                     pharmacy_score += 1.6
                     reasons.append(f"pharmacy_keyword:{kw}")
             for kw in CLINIC_KEYWORDS:
@@ -48,4 +56,3 @@ class DocumentClassifier:
 
         confidence = min(1.0, 0.55 + diff / 10.0)
         return DocumentType.CLINIC_OR_HOSPITAL, confidence, reasons, quality
-
