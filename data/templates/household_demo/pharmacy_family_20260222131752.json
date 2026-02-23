@@ -1,0 +1,109 @@
+{
+  "template_family_id": "pharmacy_family_20260222131752",
+  "scope": "household",
+  "household_id": "household_demo",
+  "document_type": "pharmacy",
+  "anchors": [
+    {
+      "text_pattern": "〇〇調剤薬局",
+      "bbox": [
+        0.06,
+        0.03,
+        0.6,
+        0.09
+      ]
+    },
+    {
+      "text_pattern": "処方箋交付医療機関△△内",
+      "bbox": [
+        0.08,
+        0.34,
+        0.92,
+        0.4
+      ]
+    },
+    {
+      "text_pattern": "領収日2026/02/2",
+      "bbox": [
+        0.52,
+        0.18,
+        0.94,
+        0.23
+      ]
+    },
+    {
+      "text_pattern": "今回お支払額¥1,840",
+      "bbox": [
+        0.58,
+        0.87,
+        0.96,
+        0.94
+      ]
+    }
+  ],
+  "field_specs": {
+    "payer_facility_name": {
+      "target_bbox": [
+        0.06,
+        0.04,
+        0.66,
+        0.1
+      ],
+      "anchor_refs": [
+        "〇〇調剤薬局"
+      ],
+      "selection_rules": [
+        "topmost_text",
+        "prefer_keyword:薬局,調剤,病院,医院,クリニック"
+      ]
+    },
+    "prescribing_facility_name": {
+      "target_bbox": [
+        0.08,
+        0.33,
+        0.72,
+        0.39
+      ],
+      "anchor_refs": [
+        "処方箋交付医療機関△△内"
+      ],
+      "selection_rules": [
+        "prefer_near_anchor",
+        "prefer_keyword:病院,医院,クリニック"
+      ]
+    },
+    "payment_date": {
+      "target_bbox": [
+        0.51,
+        0.18,
+        0.93,
+        0.23
+      ],
+      "anchor_refs": [
+        "領収日2026/02/2"
+      ],
+      "selection_rules": [
+        "prefer_label:領収日,発行日,調剤日",
+        "parse_date"
+      ]
+    },
+    "payment_amount": {
+      "target_bbox": [
+        0.62,
+        0.88,
+        0.95,
+        0.94
+      ],
+      "anchor_refs": [
+        "今回お支払額¥1,840"
+      ],
+      "selection_rules": [
+        "prefer_label:領収,請求,お支払,合計,計",
+        "parse_amount"
+      ]
+    }
+  },
+  "sample_count": 1,
+  "success_rate": 1.0,
+  "updated_at": "2026-02-22T13:17:52.003619+00:00"
+}

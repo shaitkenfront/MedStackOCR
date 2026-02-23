@@ -1,0 +1,4 @@
+paddlepaddle==3.2.2
+paddleocr==3.3.3
+PyYAML==6.0.2
+chardet==5.2.0

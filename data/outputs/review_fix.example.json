@@ -1,0 +1,23 @@
+{
+  "document_id": "2026-02-22_xxx",
+  "household_id": "household_demo",
+  "corrections": {
+    "payer_facility_name": {
+      "value": "〇〇調剤薬局",
+      "bbox": [0.06, 0.04, 0.66, 0.10]
+    },
+    "prescribing_facility_name": {
+      "value": "△△内科クリニック",
+      "bbox": [0.08, 0.33, 0.72, 0.39]
+    },
+    "payment_date": {
+      "value": "2026-02-22",
+      "bbox": [0.51, 0.18, 0.93, 0.23]
+    },
+    "payment_amount": {
+      "value": 1840,
+      "bbox": [0.62, 0.88, 0.95, 0.94]
+    }
+  }
+}
+
