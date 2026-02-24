@@ -38,7 +38,7 @@ class ReceiptExtractionPipeline:
         self.normalizer = OCRNormalizer()
         self.audit_logger = AuditLogger()
 
-    def process(self, image_path: str, household_id: str, ocr_engine: str) -> ExtractionResult:
+    def process(self, image_path: str, household_id: str | None, ocr_engine: str) -> ExtractionResult:
         adapter = create_ocr_adapter(ocr_engine, self.config)
         raw = adapter.run(image_path)
         image_size = get_image_size(image_path)

@@ -16,10 +16,13 @@ from io_utils.batch_progress import (
 )
 from io_utils.image_loader import list_images
 from io_utils.json_writer import load_json, write_json
+from notifications.service import NotificationService
 from ocr.factory import create_ocr_adapter
 from resolver.year_consistency import apply_year_consistency
 from templates.learner import TemplateLearner
 from templates.store import TemplateStore
+
+DEFAULT_CONFIG_PATH = "config.yaml"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,41 +30,41 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     extract_parser = subparsers.add_parser("extract", help="Extract one receipt image")
-    extract_parser.add_argument("--config", default=None, help="Path to config.yaml or config.json")
+    extract_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml or config.json")
     extract_parser.add_argument("--image", required=True)
-    extract_parser.add_argument("--household-id", required=True)
+    extract_parser.add_argument("--household-id", default=None)
     extract_parser.add_argument("--ocr-engine", default=None)
     extract_parser.add_argument("--force-cpu", action="store_true")
     extract_parser.add_argument("--output", required=True)
 
     batch_parser = subparsers.add_parser("batch", help="Extract all images in a directory")
-    batch_parser.add_argument("--config", default=None, help="Path to config.yaml or config.json")
-    batch_parser.add_argument("--household-id", required=True)
+    batch_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml or config.json")
+    batch_parser.add_argument("--household-id", default=None)
     batch_parser.add_argument("--ocr-engine", default=None)
     batch_parser.add_argument("--force-cpu", action="store_true")
     batch_parser.add_argument("--target-dir", required=True)
 
     compare_parser = subparsers.add_parser("compare-ocr", help="Run multiple OCR engines for one image")
-    compare_parser.add_argument("--config", default=None, help="Path to config.yaml or config.json")
+    compare_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml or config.json")
     compare_parser.add_argument("--image", required=True)
-    compare_parser.add_argument("--household-id", required=True)
+    compare_parser.add_argument("--household-id", default=None)
     compare_parser.add_argument("--ocr-engines", required=True, help="Comma-separated engines")
     compare_parser.add_argument("--force-cpu", action="store_true")
     compare_parser.add_argument("--target-dir", required=True)
 
     health_parser = subparsers.add_parser("healthcheck-ocr", help="Check OCR adapter availability")
-    health_parser.add_argument("--config", default=None, help="Path to config.yaml or config.json")
+    health_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml or config.json")
     health_parser.add_argument("--ocr-engines", required=True, help="Comma-separated engines")
     health_parser.add_argument("--force-cpu", action="store_true")
     health_parser.add_argument("--output", default=None, help="Optional output JSON path")
 
     learn_parser = subparsers.add_parser("learn-template", help="Learn household template from review correction")
-    learn_parser.add_argument("--config", default=None, help="Path to config.yaml or config.json")
+    learn_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml or config.json")
     learn_parser.add_argument("--document-result", required=True)
     learn_parser.add_argument("--review-correction", required=True)
 
     summary_parser = subparsers.add_parser("refresh-summary", help="Regenerate summary.csv in target folder")
-    summary_parser.add_argument("--config", default=None, help="Path to config.yaml or config.json")
+    summary_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml or config.json")
     summary_parser.add_argument("--target-dir", required=True)
 
     return parser
@@ -92,6 +95,15 @@ def _apply_force_cpu_config(
     yomitoku_conf = engines_conf.setdefault("yomitoku", {})
     yomitoku_conf["device"] = "cpu"
     return updated
+
+
+def _collect_new_images(images: list[Path], processed_registry: dict[str, dict[str, int]]) -> list[Path]:
+    new_images: list[Path] = []
+    for image in images:
+        key = str(image.resolve())
+        if key not in processed_registry:
+            new_images.append(image)
+    return new_images
 
 
 def cmd_extract(args: argparse.Namespace, config: dict[str, Any]) -> int:
@@ -154,6 +166,8 @@ def cmd_batch(args: argparse.Namespace, config: dict[str, Any]) -> int:
             continue
         unprocessed_images.append(image)
 
+    new_images = _collect_new_images(unprocessed_images, processed_registry)
+
     for image in unprocessed_images:
         try:
             result = pipeline.process(
@@ -193,6 +207,15 @@ def cmd_batch(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
     registry_path = save_processed_registry(processed_registry_path, processed_registry)
     csv_path = write_summary_csv(output_dir)
+    notifier = NotificationService(runtime_config)
+    notify_result = notifier.notify_new_receipts(target_dir=target_dir, new_images=new_images)
+    if notify_result.sent_channels:
+        channels = ",".join(sorted(notify_result.sent_channels))
+        print(f"notification-sent channels={channels} new_receipts={len(new_images)}")
+    if notify_result.failed_channels:
+        for channel, reason in sorted(notify_result.failed_channels.items()):
+            print(f"notification-failed channel={channel} reason={reason}")
+
     summary_path = write_json(output_dir / "summary.json", {"items": summary}, pretty=True)
     print(
         f"processed={len(succeeded)} skipped={skipped} failed={failed} "

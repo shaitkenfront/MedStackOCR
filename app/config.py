@@ -78,6 +78,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         ],
     },
+    "notifications": {
+        "enabled": False,
+        "channels": [],
+        "max_items_in_message": 10,
+        "line": {
+            "channel_access_token": None,
+            "to": None,
+        },
+        "slack": {
+            "webhook_url": None,
+        },
+        "discord": {
+            "webhook_url": None,
+        },
+    },
     "output": {
         "save_audit": True,
         "pretty_json": True,

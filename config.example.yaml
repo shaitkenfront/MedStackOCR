@@ -73,6 +73,21 @@ family_registry:
         - "ヤマダ ハナコ"
         - "ヤマタ ハナコ"
 
+notifications:
+  enabled: false
+  channels:
+    - slack
+    # - line
+    # - discord
+  max_items_in_message: 10
+  slack:
+    webhook_url:
+  discord:
+    webhook_url:
+  line:
+    channel_access_token:
+    to:
+
 output:
   save_audit: true
   pretty_json: true
