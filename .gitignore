@@ -30,6 +30,7 @@ data/outputs/**
 # Large local resources
 data/tessdata/*.traineddata
 data/samples/
+scripts/
 
 # OS generated files
 .DS_Store
