@@ -95,7 +95,7 @@ class AuditInfo:
 @dataclass(slots=True)
 class ExtractionResult:
     document_id: str
-    household_id: str
+    household_id: str | None
     document_type: DocumentType
     template_match: TemplateMatch
     fields: dict[str, Optional[Candidate]]
@@ -106,4 +106,3 @@ class ExtractionResult:
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
-

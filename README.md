@@ -22,6 +22,7 @@ pip install -r requirements-ocr-optional.txt
 
 `config.yaml` 既定では `ocr.allowed_engines: [yomitoku]` のため、`--ocr-engine` に他エンジンを指定するとエラーになります。
 `yomitoku` は、CUDA が使えない環境では自動で CPU にフォールバックします。強制的に CPU 実行したい場合は `--force-cpu` を指定してください。
+`--household-id` は任意です（指定時のみテンプレート照合に利用）。
 
 `family_registry` は必須です。`members` に家族氏名（`canonical_name`）と OCR 揺れ向けの `aliases` を登録してください。
 未登録氏名を検出した場合は以下で判定します。
@@ -44,11 +45,30 @@ pip install -r requirements-ocr-optional.txt
   - 2回目以降は `processed_files.json` と一致する画像をスキップし、未処理ファイルのみ実行
 - `--target-dir`: 入力画像（`*.jpg` など）と出力ファイル（`*.result.json`, `summary.*`）を同じフォルダで管理
 
+通知（`batch` 実行時に新規追加領収書を検知）:
+- 通知先は `notifications.channels` で選択（`line`, `slack`, `discord`）
+- 実際の送信処理は抽象化されており、本体ロジックと疎結合
+- `processed_files.json` に未登録の画像がある場合のみ通知
+
+```yaml
+notifications:
+  enabled: true
+  channels: [slack, discord]  # line/slack/discord から選択
+  max_items_in_message: 10
+  slack:
+    webhook_url: "https://hooks.slack.com/services/..."
+  discord:
+    webhook_url: "https://discord.com/api/webhooks/..."
+  line:
+    channel_access_token: "YOUR_LINE_CHANNEL_ACCESS_TOKEN"
+    to: "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
 ```bash
 python -m app.main extract \
   --config config.yaml \
   --image data/samples/pharmacy_receipt.jpg \
-  --household-id household_demo \
+  --household-id household_demo  # 任意 \
   --force-cpu \
   --output data/outputs/pharmacy_result.json
 ```
@@ -56,7 +76,7 @@ python -m app.main extract \
 ```bash
 python -m app.main batch \
   --config config.yaml \
-  --household-id household_demo \
+  --household-id household_demo  # 任意 \
   --force-cpu \
   --target-dir data/samples
 ```
@@ -71,7 +91,7 @@ python -m app.main refresh-summary \
 python -m app.main compare-ocr \
   --config config.yaml \
   --image data/samples/pharmacy_receipt.jpg \
-  --household-id household_demo \
+  --household-id household_demo  # 任意 \
   --ocr-engines yomitoku \
   --force-cpu \
   --target-dir data/outputs/compare
@@ -141,7 +161,7 @@ D:\\ProgramData\\Anaconda\\python.exe -m venv .venv-py312-paddle
 .venv-py312-paddle\\Scripts\\python.exe -m app.main extract \
   --config config.yaml \
   --image data/samples/clinic_receipt.jpg \
-  --household-id household_demo \
+  --household-id household_demo  # 任意 \
   --ocr-engine paddle \
   --output data/outputs/clinic_paddle_py312.json
 ```
