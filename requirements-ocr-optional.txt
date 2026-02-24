@@ -4,6 +4,7 @@ paddleocr==3.4.0
 paddlepaddle==3.3.0
 yomitoku==0.11.0
 deepseek-ocr==0.3.0
+google-cloud-documentai>=2.30.0
 
 # For Yomitoku GPU (example):
 # pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0 torchvision==0.23.0

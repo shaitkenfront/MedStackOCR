@@ -3,7 +3,7 @@
 `PLAN.md` に基づく、医療費控除向け領収書抽出エンジンの MVP 実装です。
 
 ## 主要機能
-- OCR 抽象化（`mock` / `tesseract` / `paddle` / `yomitoku` / `deepseek`）
+- OCR 抽象化（`mock` / `tesseract` / `paddle` / `yomitoku` / `deepseek` / `ndlocr-lite` / `documentai`）
 - OCR 正規化（`OCRLine` 共通化）
 - 帳票分類（`pharmacy` / `clinic_or_hospital` / `unknown`）
 - 施設名・日付・金額抽出
@@ -41,14 +41,14 @@ python -m app.main compare-ocr \
   --config config.yaml \
   --image data/samples/pharmacy_receipt.jpg \
   --household-id household_demo \
-  --ocr-engines mock,tesseract,paddle,yomitoku,deepseek \
+  --ocr-engines mock,tesseract,paddle,yomitoku,deepseek,ndlocr-lite,documentai \
   --output-dir data/outputs/compare
 ```
 
 ```bash
 python -m app.main healthcheck-ocr \
   --config config.yaml \
-  --ocr-engines mock,tesseract,paddle,yomitoku,deepseek
+  --ocr-engines mock,tesseract,paddle,yomitoku,deepseek,ndlocr-lite,documentai
 ```
 
 ```bash
@@ -77,6 +77,8 @@ python -m unittest discover -s tests -p "test_*.py"
 - `deepseek`: `backend: api|local` を選択可能。
   - `api`: `DS_OCR_API_KEY` が必要（`deepseek-ocr` パッケージ経由）。
   - `local`: `torch` + `transformers` が必要（`deepseek-ai/DeepSeek-OCR` をローカル推論）。
+- `ndlocr-lite`: 外部コマンド実行型。既定値は `python src/ocr.py`（`working_dir: external/ndlocr-lite`）。
+- `documentai`: Google Cloud Document AI を利用。`google-cloud-documentai` と GCP の `project_id` / `processor_id` 設定が必要。
 
 `config.yaml` 例（ローカル推論）:
 ```yaml
@@ -93,6 +95,17 @@ ocr:
       local_device: cuda
       local_dtype: bfloat16
       local_attn_impl: eager
+    ndlocr_lite:
+      enabled: true
+      command: "python src/ocr.py"
+      working_dir: "external/ndlocr-lite"
+      device: cpu
+    documentai:
+      enabled: true
+      project_id: your-gcp-project-id
+      location: us
+      processor_id: your-processor-id
+      credentials_path: C:\\path\\to\\service-account.json
 ```
 
 ## Paddle 再検証 (Python 3.12)
