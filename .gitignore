@@ -27,3 +27,6 @@ data/samples/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Local config
+config.yaml

@@ -1,0 +1,71 @@
+pipeline:
+  review_threshold: 0.72
+  reject_threshold: 0.35
+  candidate_threshold: 2.5
+
+ocr:
+  engine: mock
+  engines:
+    mock:
+      enabled: true
+    tesseract:
+      enabled: false
+      lang: jpn+eng
+      cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+      tessdata_dir: "data/tessdata"
+    paddle:
+      enabled: false
+      lang: ja
+      use_gpu: true
+      ocr_version:
+    yomitoku:
+      enabled: false
+      device: cuda
+      visualize: false
+    deepseek:
+      enabled: false
+      backend: api
+      api_key_env: DS_OCR_API_KEY
+      api_key:
+      base_url:
+      model_name:
+      mode: free_ocr
+      dpi: 200
+      local_prompt:
+      local_output_dir:
+      local_base_size: 512
+      local_image_size: 512
+      local_crop_mode: false
+      local_device: cuda
+      local_dtype: bfloat16
+      local_attn_impl: eager
+      local_trust_remote_code: true
+    ndlocr_lite:
+      enabled: false
+      command: "python src/ocr.py"
+      working_dir: "external/ndlocr-lite"
+      device: cpu
+      viz: false
+      timeout_sec: 600
+      extra_args: []
+    vision:
+      enabled: false
+    documentai:
+      enabled: false
+      project_id: 
+      location: us
+      processor_id: 
+      processor_version:
+      endpoint:
+      credentials_path:
+      timeout_sec: 120
+      mime_type:
+      field_mask:
+
+templates:
+  store_path: data/templates
+  household_match_threshold: 0.65
+
+output:
+  save_audit: true
+  pretty_json: true
