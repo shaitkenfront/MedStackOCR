@@ -2,8 +2,8 @@ from __future__ import annotations
 
 
 def main() -> int:
-    print("このブランチはWebhook起動のみ対応です。")
-    print("起動コマンド: uvicorn app.line_webhook:app --host 0.0.0.0 --port 8000")
+    print("このブランチはAWS Lambda運用専用です。")
+    print("デプロイ手順は infra/cdk/README.md を参照してください。")
     return 1
 
 

@@ -41,3 +41,7 @@ scripts/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# CDK local context (contains secrets)
+infra/cdk/cdk.context.json
+infra/cdk/cdk.out/

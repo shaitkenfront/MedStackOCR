@@ -95,7 +95,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_household_id": None,
     },
     "inbox": {
+        "backend": "sqlite",
         "sqlite_path": "data/inbox/linebot.db",
+        "dynamodb": {
+            "region": None,
+            "table_prefix": "medstackocr",
+            "event_ttl_days": 7,
+            "tables": {
+                "event_dedupe": None,
+                "receipts": None,
+                "receipt_fields": None,
+                "sessions": None,
+                "aggregate_entries": None,
+                "family_registry": None,
+            },
+        },
         "image_store_dir": "data/inbox/images",
         "image_retention_days": 14,
         "session_ttl_minutes": 60,

@@ -44,11 +44,20 @@ class ReceiptExtractionPipeline:
         self.normalizer = OCRNormalizer()
         self.audit_logger = AuditLogger()
 
-    def process(self, image_path: str, household_id: str | None, ocr_engine: str) -> ExtractionResult:
+    def process(
+        self,
+        image_path: str,
+        household_id: str | None,
+        ocr_engine: str,
+        family_registry_override: dict[str, Any] | None = None,
+    ) -> ExtractionResult:
         adapter = create_ocr_adapter(ocr_engine, self.config)
         raw = adapter.run(image_path)
         image_size = get_image_size(image_path)
         lines = self.normalizer.normalize(raw=raw, image_size=image_size)
+        family_name_extractor = self.family_name_extractor
+        if family_registry_override is not None:
+            family_name_extractor = FamilyNameExtractor(family_registry_override)
 
         document_type, _, classifier_reasons, ocr_quality = self.classifier.classify(lines)
         template_match = TemplateMatch(matched=False, template_family_id=None, score=0.0, reasons=["template_not_checked"])
@@ -72,7 +81,7 @@ class ReceiptExtractionPipeline:
         candidate_pool[FieldName.PAYMENT_AMOUNT].extend(
             self.amount_extractor.extract(lines, ocr_engine=raw.engine)
         )
-        candidate_pool[FieldName.FAMILY_MEMBER_NAME].extend(self.family_name_extractor.extract(lines))
+        candidate_pool[FieldName.FAMILY_MEMBER_NAME].extend(family_name_extractor.extract(lines))
 
         if matched_template is not None:
             template_candidates = self.template_matcher.apply_template(matched_template, lines)

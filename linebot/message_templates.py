@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.enums import FieldName
-from linebot.quick_replies import postback_action, with_quick_reply
+from linebot.quick_replies import message_action, postback_action, with_quick_reply
 
 FIELD_LABELS = {
     FieldName.PAYER_FACILITY_NAME: "医療機関",
@@ -18,6 +18,8 @@ EDITABLE_FIELDS = (
     FieldName.PAYMENT_AMOUNT,
     FieldName.FAMILY_MEMBER_NAME,
 )
+
+FAMILY_REGISTRATION_FINISH_TEXT = "家族氏名の登録を終了"
 
 
 def _text(value: Any) -> str:
@@ -170,3 +172,53 @@ def build_aggregate_message(title: str, total: int, count: int, pending: int = 0
         }
     ]
 
+
+def build_yearly_cumulative_message(year_totals: list[tuple[int, int]]) -> list[dict[str, Any]]:
+    lines: list[str] = []
+    for year, total in year_totals:
+        lines.append(f"{year}年の累計医療費: {total:,}円")
+    if not lines:
+        lines.append("今年の累計医療費: 0円")
+    return [{"type": "text", "text": "\n".join(lines)}]
+
+
+def _family_registration_actions() -> list[dict[str, Any]]:
+    return [message_action(FAMILY_REGISTRATION_FINISH_TEXT, FAMILY_REGISTRATION_FINISH_TEXT)]
+
+
+def build_family_registration_prompt_message() -> list[dict[str, Any]]:
+    text = (
+        "ご家族の名前を教えてください。"
+        "カタカナや、良く間違えられる漢字も登録しておくと認識の精度が上ります。\n"
+        "1行に1名、別表記は「,」区切りで登録できます。\n"
+        "例: 山田 太郎, ヤマダ タロウ, 山田太朗\n"
+        "登録が終わったら「家族氏名の登録を終了」を押してください。"
+    )
+    return [with_quick_reply(text, _family_registration_actions())]
+
+
+def build_family_registration_saved_message(total_members: int, latest: list[str]) -> list[dict[str, Any]]:
+    preview = "、".join(latest[:3])
+    head = f"{preview} を登録しました。\n" if preview else ""
+    text = (
+        f"{head}登録済み: {total_members}名\n"
+        "続けて名前を送るか、「家族氏名の登録を終了」を押してください。"
+    )
+    return [with_quick_reply(text, _family_registration_actions())]
+
+
+def build_family_registration_need_member_message() -> list[dict[str, Any]]:
+    text = (
+        "家族氏名が未登録です。最低1名は登録してください。\n"
+        "登録が終わったら「家族氏名の登録を終了」を押してください。"
+    )
+    return [with_quick_reply(text, _family_registration_actions())]
+
+
+def build_family_registration_completed_message(total_members: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "text",
+            "text": f"家族氏名の登録が完了しました（{total_members}名）。領収書画像を送信してください。",
+        }
+    ]

@@ -1,21 +1,22 @@
 # family_registry 運用手順
 
 ## 1. 事前準備
-- `family_registry.template.yaml` を開く。
-- `canonical_name` は正規表記（例: `山田 太郎`）で統一する。
-- `aliases` には OCR の誤認識や表記ゆれを登録する。
+- 家族氏名辞書は LINEユーザーID ごとに DynamoDB へ保存される。
+- 友だち追加（`follow`）時に、家族氏名登録フローを開始する。
 
 ## 2. 登録ルール
-- すべての家族を `members` に登録する（必須）。
-- `aliases` には次を優先して追加する。
+- すべての家族を 1名ずつ登録する（最低1名必須）。
+- 1行に1名、同一人物の別表記はカンマ区切りで登録する。
+  - 例: `山田 太郎, ヤマダ タロウ, 山田太朗`
+- 別表記には次を優先して追加する。
   - スペース有無（`山田太郎` / `山田 太郎`）
   - 敬称付き（`山田 太郎様`）
   - カナ表記（`ヤマダ タロウ`）
   - よく出る誤読（例: `ヤマダ` -> `ヤマタ`）
 
-## 3. 設定反映
-- `config.yaml` の `family_registry` をテンプレート内容で更新する。
-- `required: true` のまま運用する。
+## 3. 登録完了
+- クイックリプライ `家族氏名の登録を終了` を押す。
+- 登録完了前は通常のOCR処理には進まない。
 
 ## 4. 判定仕様（現行）
 - 辞書一致（`canonical_name` または `aliases` 一致）: 通常判定
@@ -23,10 +24,10 @@
 - 未登録かつ異姓: `REJECTED`
 
 ## 5. 日次運用フロー
-1. Webhook起動: `uvicorn app.line_webhook:app --host 0.0.0.0 --port 8000`
+1. LINE Developers の Webhook URL を AWS API Gateway（CDK出力 `LineWebhookUrl`）に設定
 2. LINEで領収書画像を送信
 3. `REVIEW_REQUIRED` / `REJECTED` の `family_member_name` と `decision.reasons` を確認
-4. 正当な家族なら `aliases` を追加して再送信
+4. 正当な家族なら、再度名前（別表記）を送って辞書を更新
 5. 他姓ノイズなら辞書追加せずそのまま `REJECTED` を維持
 
 ## 6. メンテナンスの目安

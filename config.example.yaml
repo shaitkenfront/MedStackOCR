@@ -90,7 +90,19 @@ line_messaging:
   default_household_id:
 
 inbox:
+  backend: sqlite  # sqlite or dynamodb
   sqlite_path: data/inbox/linebot.db
+  dynamodb:
+    region:
+    table_prefix: medstackocr
+    event_ttl_days: 7
+    tables:
+      event_dedupe:
+      receipts:
+      receipt_fields:
+      sessions:
+      aggregate_entries:
+      family_registry:
   image_store_dir: data/inbox/images
   image_retention_days: 14
   session_ttl_minutes: 60

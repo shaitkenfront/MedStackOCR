@@ -95,6 +95,26 @@ class InboxRepository:
                     event_id TEXT PRIMARY KEY,
                     received_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS family_registry_profiles (
+                    line_user_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS family_registry_members (
+                    line_user_id TEXT NOT NULL,
+                    member_id TEXT NOT NULL,
+                    canonical_name TEXT NOT NULL,
+                    aliases_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (line_user_id, member_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_family_registry_user_canonical
+                    ON family_registry_members(line_user_id, canonical_name);
                 """
             )
             conn.commit()
@@ -412,6 +432,206 @@ class InboxRepository:
             ).fetchone()
         return int((row["count"] if row else 0) or 0)
 
+    def ensure_family_registration_started(self, line_user_id: str) -> bool:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return False
+        now = _utc_now()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT status, created_at FROM family_registry_profiles WHERE line_user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO family_registry_profiles(
+                        line_user_id, status, created_at, updated_at, completed_at
+                    ) VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (user_id, "in_progress", now, now, None),
+                )
+                conn.commit()
+                return True
+            status = str(existing["status"] or "")
+            if status != "completed":
+                conn.execute(
+                    """
+                    UPDATE family_registry_profiles
+                    SET status = ?, updated_at = ?
+                    WHERE line_user_id = ?
+                    """,
+                    ("in_progress", now, user_id),
+                )
+                conn.commit()
+        return False
+
+    def is_family_registration_completed(self, line_user_id: str) -> bool:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM family_registry_profiles WHERE line_user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        return str(row["status"] or "") == "completed"
+
+    def complete_family_registration(self, line_user_id: str) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return
+        now = _utc_now()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT line_user_id FROM family_registry_profiles WHERE line_user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO family_registry_profiles(
+                        line_user_id, status, created_at, updated_at, completed_at
+                    ) VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (user_id, "completed", now, now, now),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE family_registry_profiles
+                    SET status = ?, updated_at = ?, completed_at = ?
+                    WHERE line_user_id = ?
+                    """,
+                    ("completed", now, now, user_id),
+                )
+            conn.commit()
+
+    def upsert_family_member(self, line_user_id: str, canonical_name: str, aliases: list[str]) -> str:
+        user_id = str(line_user_id or "").strip()
+        canonical = _normalize_family_name(canonical_name)
+        if not user_id or not canonical:
+            return ""
+
+        merged_aliases = _normalize_aliases([canonical, *aliases])
+        now = _utc_now()
+        with self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT member_id, aliases_json, created_at
+                FROM family_registry_members
+                WHERE line_user_id = ? AND canonical_name = ?
+                """,
+                (user_id, canonical),
+            ).fetchone()
+
+            if existing is None:
+                member_id = str(uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO family_registry_members(
+                        line_user_id, member_id, canonical_name, aliases_json, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        member_id,
+                        canonical,
+                        json.dumps(merged_aliases, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+                return member_id
+
+            existing_aliases = _load_json(existing["aliases_json"])
+            merged_inputs: list[Any] = [canonical]
+            if isinstance(existing_aliases, list):
+                merged_inputs.extend(existing_aliases)
+            merged_inputs.extend(aliases)
+            combined = _normalize_aliases(merged_inputs)
+            member_id = str(existing["member_id"])
+            conn.execute(
+                """
+                UPDATE family_registry_members
+                SET aliases_json = ?, updated_at = ?
+                WHERE line_user_id = ? AND member_id = ?
+                """,
+                (json.dumps(combined, ensure_ascii=False), now, user_id, member_id),
+            )
+            conn.commit()
+            return member_id
+
+    def list_family_members(self, line_user_id: str) -> list[dict[str, Any]]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT canonical_name, aliases_json
+                FROM family_registry_members
+                WHERE line_user_id = ?
+                ORDER BY created_at ASC, canonical_name ASC
+                """,
+                (user_id,),
+            ).fetchall()
+
+        members: list[dict[str, Any]] = []
+        for row in rows:
+            canonical_name = _normalize_family_name(row["canonical_name"])
+            aliases_raw = _load_json(row["aliases_json"])
+            aliases = _normalize_aliases(aliases_raw if isinstance(aliases_raw, list) else [])
+            aliases = [alias for alias in aliases if alias != canonical_name]
+            if not canonical_name:
+                continue
+            members.append(
+                {
+                    "canonical_name": canonical_name,
+                    "aliases": aliases,
+                }
+            )
+        return members
+
+    def purge_user_data(self, line_user_id: str) -> list[str]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return []
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT receipt_id, image_path
+                FROM receipts
+                WHERE line_user_id = ?
+                """,
+                (user_id,),
+            ).fetchall()
+            receipt_ids = [str(row["receipt_id"]) for row in rows]
+            image_paths = [
+                str(row["image_path"]).strip()
+                for row in rows
+                if str(row["image_path"]).strip()
+            ]
+
+            if receipt_ids:
+                placeholders = ",".join("?" for _ in receipt_ids)
+                conn.execute(
+                    f"DELETE FROM receipt_fields WHERE receipt_id IN ({placeholders})",
+                    tuple(receipt_ids),
+                )
+            conn.execute("DELETE FROM receipts WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM conversation_sessions WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM aggregate_entries WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM family_registry_members WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM family_registry_profiles WHERE line_user_id = ?", (user_id,))
+            conn.commit()
+
+        return sorted(set(image_paths))
+
 
 def _to_text(value: Any) -> str | None:
     if value is None:
@@ -482,3 +702,23 @@ def _to_date_text(value: Any) -> str | None:
             except Exception:
                 return text
     return text
+
+
+def _normalize_family_name(value: Any) -> str:
+    text = str(value or "").replace("\u3000", " ").strip()
+    return " ".join(part for part in text.split(" ") if part)
+
+
+def _normalize_aliases(values: list[Any]) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        alias = _normalize_family_name(value)
+        if not alias:
+            continue
+        key = alias.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        aliases.append(alias)
+    return aliases

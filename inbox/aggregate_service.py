@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from inbox.repository import InboxRepository
+from inbox.repository_interface import InboxRepositoryProtocol
 from linebot import message_templates
 
 
 class AggregateService:
-    def __init__(self, repository: InboxRepository) -> None:
+    def __init__(self, repository: InboxRepositoryProtocol) -> None:
         self.repository = repository
 
     def handle_text_command(self, line_user_id: str, text: str) -> list[dict[str, Any]] | None:
@@ -34,4 +34,3 @@ class AggregateService:
         if command == "ヘルプ":
             return message_templates.build_help_message()
         return None
-

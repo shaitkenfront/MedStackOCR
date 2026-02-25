@@ -10,8 +10,10 @@ from uuid import uuid4
 from app.pipeline import ReceiptExtractionPipeline
 from inbox.aggregate_service import AggregateService
 from inbox.conversation_service import ConversationService
-from inbox.repository import InboxRepository
+from inbox.repository_factory import create_inbox_repository
+from inbox.repository_interface import InboxRepositoryProtocol
 from inbox.retention import cleanup_expired_images
+from linebot.event_ids import build_line_event_id
 from linebot import message_templates
 from linebot.media_client import LineMediaApiClient, guess_extension
 from linebot.reply_client import LineReplyClient
@@ -25,7 +27,7 @@ class LineWebhookHandler:
         config: dict[str, Any],
         media_client: LineMediaApiClient | None = None,
         reply_client: LineReplyClient | None = None,
-        repository: InboxRepository | None = None,
+        repository: InboxRepositoryProtocol | None = None,
     ) -> None:
         self.config = config
         self.line_conf = config.get("line_messaging", {})
@@ -41,8 +43,7 @@ class LineWebhookHandler:
             if str(user_id).strip()
         }
 
-        sqlite_path = str(self.inbox_conf.get("sqlite_path", "data/inbox/linebot.db"))
-        self.repository = repository or InboxRepository(sqlite_path=sqlite_path)
+        self.repository = repository or create_inbox_repository(config)
         self.aggregate_service = AggregateService(self.repository)
         self.conversation_service = ConversationService(
             repository=self.repository,
@@ -90,7 +91,7 @@ class LineWebhookHandler:
             if not isinstance(event, dict):
                 skipped += 1
                 continue
-            event_id = _event_id(event)
+            event_id = build_line_event_id(event)
             if event_id and not self.repository.mark_event_processed(event_id):
                 skipped += 1
                 continue
@@ -204,17 +205,6 @@ class LineWebhookHandler:
         if self._pipeline is None:
             self._pipeline = ReceiptExtractionPipeline(self._runtime_config)
         return self._pipeline
-
-
-def _event_id(event: dict[str, Any]) -> str:
-    webhook_event_id = str(event.get("webhookEventId", "") or "").strip()
-    if webhook_event_id:
-        return webhook_event_id
-    timestamp = str(event.get("timestamp", "") or "").strip()
-    message_id = str(event.get("message", {}).get("id", "") or "").strip()
-    event_type = str(event.get("type", "") or "").strip()
-    return ":".join(part for part in (timestamp, event_type, message_id) if part)
-
 
 def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")

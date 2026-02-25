@@ -5,7 +5,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.enums import FieldName
+from core.enums import DecisionStatus, DocumentType, FieldName
+from core.models import AuditInfo, Candidate, Decision, ExtractionResult, TemplateMatch
 from inbox.repository import InboxRepository
 
 
@@ -64,7 +65,106 @@ class InboxRepositoryTest(unittest.TestCase):
             fields = repo.get_receipt_fields("R1")
             self.assertEqual(fields.get(FieldName.PAYMENT_AMOUNT), 2480)
 
+    def test_family_registration_state_and_members(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            self.assertFalse(repo.is_family_registration_completed("U1"))
+            self.assertTrue(repo.ensure_family_registration_started("U1"))
+            self.assertFalse(repo.ensure_family_registration_started("U1"))
+
+            member_id = repo.upsert_family_member(
+                line_user_id="U1",
+                canonical_name="山田 太郎",
+                aliases=["ヤマダ タロウ"],
+            )
+            self.assertTrue(member_id)
+            repo.upsert_family_member(
+                line_user_id="U1",
+                canonical_name="山田 太郎",
+                aliases=["山田太郎", "ヤマダ タロウ"],
+            )
+            members = repo.list_family_members("U1")
+            self.assertEqual(len(members), 1)
+            self.assertEqual(members[0]["canonical_name"], "山田 太郎")
+            self.assertIn("ヤマダ タロウ", members[0]["aliases"])
+            self.assertIn("山田太郎", members[0]["aliases"])
+
+            repo.complete_family_registration("U1")
+            self.assertTrue(repo.is_family_registration_completed("U1"))
+
+    def test_purge_user_data_removes_related_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            repo.ensure_family_registration_started("U1")
+            repo.upsert_family_member("U1", "山田 太郎", ["ヤマダ タロウ"])
+            repo.upsert_session(
+                line_user_id="U1",
+                receipt_id="R1",
+                state="AWAIT_CONFIRM",
+                payload={},
+                expires_at="2999-01-01T00:00:00+00:00",
+            )
+            repo.upsert_aggregate_entry(
+                receipt_id="R1",
+                line_user_id="U1",
+                fields={
+                    FieldName.PAYMENT_DATE: "2026-02-01",
+                    FieldName.PAYMENT_AMOUNT: 1000,
+                    FieldName.FAMILY_MEMBER_NAME: "山田 太郎",
+                },
+                status="tentative",
+            )
+            repo.save_receipt_result(
+                receipt_id="R1",
+                line_user_id="U1",
+                line_message_id="m1",
+                image_path="s3://bucket/raw/2026/02/01/r1.jpg",
+                image_sha256="abc",
+                result=_result(),
+            )
+            repo.save_receipt_result(
+                receipt_id="R2",
+                line_user_id="U2",
+                line_message_id="m2",
+                image_path="s3://bucket/raw/2026/02/01/r2.jpg",
+                image_sha256="def",
+                result=_result(),
+            )
+
+            paths = repo.purge_user_data("U1")
+            self.assertEqual(paths, ["s3://bucket/raw/2026/02/01/r1.jpg"])
+            self.assertEqual(repo.get_receipt_fields("R1"), {})
+            self.assertTrue(repo.get_receipt_fields("R2"))
+            self.assertIsNone(repo.get_active_session("U1"))
+            self.assertEqual(repo.get_pending_count("U1"), 0)
+            self.assertFalse(repo.list_family_members("U1"))
+            self.assertFalse(repo.is_family_registration_completed("U1"))
+
+
+def _result() -> ExtractionResult:
+    return ExtractionResult(
+        document_id="doc",
+        household_id=None,
+        document_type=DocumentType.PHARMACY,
+        template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+        fields={
+            FieldName.PAYMENT_AMOUNT: Candidate(
+                field=FieldName.PAYMENT_AMOUNT,
+                value_raw="1000",
+                value_normalized=1000,
+                source_line_indices=[0],
+                bbox=None,
+                score=1.0,
+                ocr_confidence=0.9,
+                reasons=["test"],
+            )
+        },
+        decision=Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=0.5, reasons=["test"]),
+        audit=AuditInfo(engine="test", engine_version="1", pipeline_version="1"),
+        candidate_pool={},
+        ocr_lines=[],
+    )
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,0 +1,14 @@
+{
+  "app": "python app.py",
+  "context": {
+    "prefix": "medstackocr",
+    "region": "ap-northeast-1",
+    "line_webhook_path": "/webhook/line",
+    "receipt_prefix": "raw",
+    "receipt_bucket_name": "medstackocr-027496193801-apne1-receipts",
+    "app_secrets_name": "medstackocr/prod/app-secrets",
+    "docai_project_id": "messtackocr",
+    "docai_location": "us",
+    "docai_processor_id": "54aaada2a941413"
+  }
+}

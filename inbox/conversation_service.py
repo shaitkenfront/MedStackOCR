@@ -8,7 +8,7 @@ from urllib.parse import parse_qs
 from core.enums import DecisionStatus, FieldName
 from core.models import ExtractionResult
 from inbox.models import ConversationSession
-from inbox.repository import InboxRepository
+from inbox.repository_interface import InboxRepositoryProtocol
 from inbox.state_machine import (
     STATE_AWAIT_CONFIRM,
     STATE_AWAIT_FIELD_CANDIDATE,
@@ -36,7 +36,7 @@ FIELD_NAME_BY_LABEL = {
 class ConversationService:
     def __init__(
         self,
-        repository: InboxRepository,
+        repository: InboxRepositoryProtocol,
         session_ttl_minutes: int = 60,
         max_candidate_options: int = 3,
     ) -> None:
@@ -61,7 +61,9 @@ class ConversationService:
                 fields=fields,
                 status="confirmed",
             )
-            return message_templates.build_auto_accept_message(receipt_id=receipt_id, fields=fields)
+            messages = message_templates.build_auto_accept_message(receipt_id=receipt_id, fields=fields)
+            messages.extend(self._build_cumulative_messages(line_user_id))
+            return messages
 
         if decision == DecisionStatus.REVIEW_REQUIRED.value:
             self.repository.upsert_aggregate_entry(
@@ -122,7 +124,9 @@ class ConversationService:
             )
             if session:
                 self.repository.delete_session(session.session_id)
-            return message_templates.build_confirmed_message(fields)
+            messages = message_templates.build_confirmed_message(fields)
+            messages.extend(self._build_cumulative_messages(line_user_id))
+            return messages
 
         if action == "edit":
             session = self._ensure_session_for_edit(line_user_id=line_user_id, receipt_id=receipt_id, session=session)
@@ -415,6 +419,20 @@ class ConversationService:
     def _expires_at(self) -> str:
         deadline = datetime.now(timezone.utc) + timedelta(minutes=self.session_ttl_minutes)
         return deadline.isoformat()
+
+    def _build_cumulative_messages(self, line_user_id: str) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        current_year = now.year
+        totals: list[tuple[int, int]] = []
+        if now.month <= 3:
+            prev_total, _ = self.repository.get_year_summary(line_user_id, current_year - 1)
+            current_total, _ = self.repository.get_year_summary(line_user_id, current_year)
+            totals.append((current_year - 1, prev_total))
+            totals.append((current_year, current_total))
+        else:
+            current_total, _ = self.repository.get_year_summary(line_user_id, current_year)
+            totals.append((current_year, current_total))
+        return message_templates.build_yearly_cumulative_message(totals)
 
     @staticmethod
     def _normalize_text_value(field_name: str, value: str) -> Any:

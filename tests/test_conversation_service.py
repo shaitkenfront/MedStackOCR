@@ -65,10 +65,11 @@ class ConversationServiceTest(unittest.TestCase):
             fields = repo.get_receipt_fields("R1")
             self.assertEqual(fields.get(FieldName.PAYMENT_AMOUNT), 1200)
 
-            service.handle_postback("U1", "a=ok&r=R1")
+            messages = service.handle_postback("U1", "a=ok&r=R1")
             self.assertIsNone(repo.get_active_session("U1"))
             total, count = repo.get_year_summary("U1", year)
             self.assertEqual((total, count), (1200, 1))
+            _assert_cumulative_message(messages, expected_current_year_total=1200)
 
     def test_auto_accept_sets_confirmed(self) -> None:
         year = datetime.now(timezone.utc).year
@@ -91,13 +92,25 @@ class ConversationServiceTest(unittest.TestCase):
                 candidate_pool={},
                 ocr_lines=[],
             )
-            service.handle_new_result("U2", "R2", result)
+            messages = service.handle_new_result("U2", "R2", result)
             self.assertIsNone(repo.get_active_session("U2"))
             total, count = repo.get_year_summary("U2", year)
             self.assertEqual((total, count), (3500, 1))
             self.assertEqual(repo.get_pending_count("U2"), 0)
+            _assert_cumulative_message(messages, expected_current_year_total=3500)
+
+
+def _assert_cumulative_message(messages: list[dict[str, object]], expected_current_year_total: int) -> None:
+    now = datetime.now(timezone.utc)
+    year = now.year
+    text_messages = [str(message.get("text", "")) for message in messages if isinstance(message, dict)]
+    joined = "\n".join(text_messages)
+    if now.month <= 3:
+        assert f"{year - 1}年の累計医療費: 0円" in joined
+        assert f"{year}年の累計医療費: {expected_current_year_total:,}円" in joined
+    else:
+        assert f"{year}年の累計医療費: {expected_current_year_total:,}円" in joined
 
 
 if __name__ == "__main__":
     unittest.main()
-
