@@ -5,7 +5,7 @@
 - API Gateway (HTTP API)
 - Lambda `line-ingress` / `line-worker`
 - SQS FIFO + DLQ
-- DynamoDB 6テーブル（家族氏名辞書テーブル含む）
+- DynamoDB 8テーブル（家族氏名辞書・学習ルール・OCR利用制限テーブル含む）
 - S3（領収書画像保存）
 
 ## 1. 依存インストール
@@ -51,7 +51,15 @@ aws secretsmanager put-secret-value \
   --secret-string file://app-secrets.json
 ```
 
-## 3. デプロイ
+## 3. DocAI依存Layerの作成
+`line-worker` は `google-cloud-documentai` を Lambda Layer から読み込みます。
+デプロイ前に1回実行してください。
+
+```powershell
+powershell -File infra/cdk/scripts/build_docai_layer.ps1
+```
+
+## 4. デプロイ
 ```bash
 cdk bootstrap
 cdk deploy
@@ -59,6 +67,8 @@ cdk deploy
 
 デプロイ後、`LineWebhookUrl` の出力を LINE Developers Console の Webhook URL に設定してください。
 家族氏名辞書は `FamilyRegistryTableName` 出力の DynamoDB テーブルに保存されます。
+訂正学習ルールは `LearningRulesTableName` 出力の DynamoDB テーブルに保存されます。
+OCR利用制限カウンタは `OcrUsageGuardTableName` 出力の DynamoDB テーブルに保存されます。
 このテーブルは KMS カスタマーマネージドキーで暗号化されます。
 
 このリポジトリでは非機密の実環境値を `cdk.json` に設定済みです。

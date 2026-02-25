@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -42,6 +43,7 @@ class InboxRepository:
                     line_message_id TEXT NOT NULL,
                     image_path TEXT NOT NULL,
                     image_sha256 TEXT NOT NULL,
+                    duplicate_key TEXT,
                     document_id TEXT,
                     decision_status TEXT NOT NULL,
                     decision_confidence REAL NOT NULL,
@@ -115,9 +117,48 @@ class InboxRepository:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_family_registry_user_canonical
                     ON family_registry_members(line_user_id, canonical_name);
+
+                CREATE TABLE IF NOT EXISTS correction_rules (
+                    line_user_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    context_key TEXT NOT NULL,
+                    corrected_value TEXT NOT NULL,
+                    count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (line_user_id, field_name, context_key, corrected_value)
+                );
+                CREATE INDEX IF NOT EXISTS idx_correction_rules_lookup
+                    ON correction_rules(line_user_id, field_name, context_key, count DESC, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS ocr_usage_guard (
+                    scope_key TEXT NOT NULL,
+                    window_key TEXT NOT NULL,
+                    count INTEGER NOT NULL,
+                    expires_at_epoch INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (scope_key, window_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ocr_usage_guard_expires
+                    ON ocr_usage_guard(expires_at_epoch);
                 """
             )
+            self._ensure_column_exists(conn, "receipts", "duplicate_key", "TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receipts_user_hash ON receipts(line_user_id, image_sha256)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receipts_user_duplicate_key ON receipts(line_user_id, duplicate_key)"
+            )
             conn.commit()
+
+    @staticmethod
+    def _ensure_column_exists(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        if column_name in existing:
+            return
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
     def mark_event_processed(self, event_id: str) -> bool:
         key = (event_id or "").strip()
@@ -140,14 +181,16 @@ class InboxRepository:
         processing_error: str | None = None,
     ) -> None:
         now = _utc_now()
+        extracted_fields = _extracted_fields_from_result(result)
+        duplicate_key = _build_duplicate_key(extracted_fields)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO receipts(
-                    receipt_id, line_user_id, line_message_id, image_path, image_sha256,
+                    receipt_id, line_user_id, line_message_id, image_path, image_sha256, duplicate_key,
                     document_id, decision_status, decision_confidence, processing_error,
                     created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt_id,
@@ -155,6 +198,7 @@ class InboxRepository:
                     line_message_id,
                     image_path,
                     image_sha256,
+                    duplicate_key,
                     result.document_id,
                     result.decision.status.value,
                     float(result.decision.confidence),
@@ -628,9 +672,288 @@ class InboxRepository:
             conn.execute("DELETE FROM aggregate_entries WHERE line_user_id = ?", (user_id,))
             conn.execute("DELETE FROM family_registry_members WHERE line_user_id = ?", (user_id,))
             conn.execute("DELETE FROM family_registry_profiles WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM correction_rules WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM ocr_usage_guard WHERE scope_key = ?", (_ocr_guard_scope_user(user_id),))
             conn.commit()
 
         return sorted(set(image_paths))
+
+    def record_field_correction(
+        self,
+        line_user_id: str,
+        field_name: str,
+        context_key: str,
+        corrected_value: Any,
+    ) -> None:
+        user_id = str(line_user_id or "").strip()
+        normalized_field = str(field_name or "").strip()
+        normalized_context = _normalize_context_key(context_key)
+        normalized_value = _normalize_learning_value(corrected_value)
+        if not user_id or not normalized_field or not normalized_context or normalized_value is None:
+            return
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO correction_rules(
+                    line_user_id, field_name, context_key, corrected_value, count, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(line_user_id, field_name, context_key, corrected_value)
+                DO UPDATE SET count = count + 1, updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    normalized_field,
+                    normalized_context,
+                    normalized_value,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def get_field_correction_hint(
+        self,
+        line_user_id: str,
+        field_name: str,
+        context_key: str,
+        min_count: int = 2,
+    ) -> Any | None:
+        user_id = str(line_user_id or "").strip()
+        normalized_field = str(field_name or "").strip()
+        normalized_context = _normalize_context_key(context_key)
+        threshold = max(1, int(min_count))
+        if not user_id or not normalized_field or not normalized_context:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT corrected_value, count
+                FROM correction_rules
+                WHERE line_user_id = ?
+                  AND field_name = ?
+                  AND context_key = ?
+                ORDER BY count DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (user_id, normalized_field, normalized_context),
+            ).fetchone()
+        if row is None:
+            return None
+        if int(row["count"] or 0) < threshold:
+            return None
+        value = str(row["corrected_value"] or "")
+        if normalized_field == FieldName.PAYMENT_AMOUNT:
+            return _to_int(value) if _to_int(value) is not None else value
+        return value
+
+    def find_potential_duplicates(
+        self,
+        line_user_id: str,
+        image_sha256: str,
+        duplicate_key: str | None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        user_id = str(line_user_id or "").strip()
+        image_hash = str(image_sha256 or "").strip()
+        normalized_key = str(duplicate_key or "").strip()
+        max_items = max(1, int(limit))
+        if not user_id:
+            return []
+
+        where_parts = ["line_user_id = ?"]
+        params: list[Any] = [user_id]
+        conditions: list[str] = []
+        if image_hash:
+            conditions.append("image_sha256 = ?")
+            params.append(image_hash)
+        if normalized_key:
+            conditions.append("duplicate_key = ?")
+            params.append(normalized_key)
+        if not conditions:
+            return []
+        where_parts.append("(" + " OR ".join(conditions) + ")")
+        sql = (
+            "SELECT receipt_id, image_sha256, duplicate_key, created_at "
+            "FROM receipts "
+            f"WHERE {' AND '.join(where_parts)} "
+            "ORDER BY created_at DESC "
+            "LIMIT ?"
+        )
+        params.append(max_items * 2)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+
+        duplicates: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for row in rows:
+            receipt_id = str(row["receipt_id"] or "").strip()
+            if not receipt_id or receipt_id in seen_ids:
+                continue
+            seen_ids.add(receipt_id)
+            reasons: list[str] = []
+            if image_hash and str(row["image_sha256"] or "") == image_hash:
+                reasons.append("image_sha256")
+            if normalized_key and str(row["duplicate_key"] or "") == normalized_key:
+                reasons.append("fields")
+            duplicates.append(
+                {
+                    "receipt_id": receipt_id,
+                    "created_at": str(row["created_at"] or ""),
+                    "reasons": reasons,
+                }
+            )
+            if len(duplicates) >= max_items:
+                break
+        return duplicates
+
+    def get_latest_receipt_id(self, line_user_id: str) -> str | None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT receipt_id
+                FROM receipts
+                WHERE line_user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        receipt_id = str(row["receipt_id"] or "").strip()
+        return receipt_id or None
+
+    def consume_ocr_quota(
+        self,
+        *,
+        line_user_id: str,
+        now_utc: datetime,
+        user_per_minute_limit: int,
+        user_per_day_limit: int,
+        global_per_day_limit: int,
+    ) -> tuple[bool, str | None]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return False, "user_minute"
+
+        user_minute_limit = max(1, int(user_per_minute_limit))
+        user_day_limit = max(1, int(user_per_day_limit))
+        global_day_limit = max(1, int(global_per_day_limit))
+        now = now_utc.astimezone(timezone.utc)
+        now_epoch = int(now.timestamp())
+        now_text = now.isoformat()
+        minute_token = now.strftime("%Y%m%d%H%M")
+        day_token = now.strftime("%Y%m%d")
+
+        buckets = [
+            {
+                "scope_key": _ocr_guard_scope_user(user_id),
+                "window_key": f"MIN#{minute_token}",
+                "limit": user_minute_limit,
+                "reason": "user_minute",
+                "expires_at_epoch": now_epoch + 120,
+            },
+            {
+                "scope_key": _ocr_guard_scope_user(user_id),
+                "window_key": f"DAY#{day_token}",
+                "limit": user_day_limit,
+                "reason": "user_day",
+                "expires_at_epoch": now_epoch + 172800,
+            },
+            {
+                "scope_key": _ocr_guard_scope_global(),
+                "window_key": f"DAY#{day_token}",
+                "limit": global_day_limit,
+                "reason": "global_day",
+                "expires_at_epoch": now_epoch + 172800,
+            },
+        ]
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM ocr_usage_guard WHERE expires_at_epoch <= ?", (now_epoch,))
+
+            for bucket in buckets:
+                row = conn.execute(
+                    """
+                    SELECT count
+                    FROM ocr_usage_guard
+                    WHERE scope_key = ? AND window_key = ?
+                    """,
+                    (bucket["scope_key"], bucket["window_key"]),
+                ).fetchone()
+                current = int(row["count"] or 0) if row is not None else 0
+                if current >= int(bucket["limit"]):
+                    conn.commit()
+                    return False, str(bucket["reason"])
+
+            for bucket in buckets:
+                row = conn.execute(
+                    """
+                    SELECT count
+                    FROM ocr_usage_guard
+                    WHERE scope_key = ? AND window_key = ?
+                    """,
+                    (bucket["scope_key"], bucket["window_key"]),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO ocr_usage_guard(scope_key, window_key, count, expires_at_epoch, updated_at)
+                        VALUES(?, ?, ?, ?, ?)
+                        """,
+                        (
+                            bucket["scope_key"],
+                            bucket["window_key"],
+                            1,
+                            int(bucket["expires_at_epoch"]),
+                            now_text,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE ocr_usage_guard
+                        SET count = count + 1, updated_at = ?
+                        WHERE scope_key = ? AND window_key = ?
+                        """,
+                        (now_text, bucket["scope_key"], bucket["window_key"]),
+                    )
+            conn.commit()
+        return True, None
+
+    def delete_receipt(self, line_user_id: str, receipt_id: str) -> str | None:
+        user_id = str(line_user_id or "").strip()
+        rid = str(receipt_id or "").strip()
+        if not user_id or not rid:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT image_path
+                FROM receipts
+                WHERE receipt_id = ? AND line_user_id = ?
+                """,
+                (rid, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            image_path = str(row["image_path"] or "").strip() or None
+            conn.execute("DELETE FROM receipt_fields WHERE receipt_id = ?", (rid,))
+            conn.execute("DELETE FROM aggregate_entries WHERE receipt_id = ?", (rid,))
+            conn.execute(
+                "DELETE FROM conversation_sessions WHERE line_user_id = ? AND receipt_id = ?",
+                (user_id, rid),
+            )
+            conn.execute(
+                "DELETE FROM receipts WHERE receipt_id = ? AND line_user_id = ?",
+                (rid, user_id),
+            )
+            conn.commit()
+        return image_path
 
 
 def _to_text(value: Any) -> str | None:
@@ -722,3 +1045,58 @@ def _normalize_aliases(values: list[Any]) -> list[str]:
         seen.add(key)
         aliases.append(alias)
     return aliases
+
+
+def _normalize_learning_value(value: Any) -> str | None:
+    text = _to_text(value)
+    if text is None:
+        return None
+    normalized = str(text).strip()
+    return normalized or None
+
+
+def _normalize_context_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _extracted_fields_from_result(result: ExtractionResult) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for field_name, candidate in result.fields.items():
+        if candidate is None:
+            continue
+        value = candidate.value_normalized
+        if value in (None, ""):
+            value = candidate.value_raw
+        output[field_name] = value
+    return output
+
+
+def _build_duplicate_key(fields: dict[str, Any]) -> str | None:
+    date_text = _to_date_text(fields.get(FieldName.PAYMENT_DATE))
+    amount = _to_int(fields.get(FieldName.PAYMENT_AMOUNT))
+    family_name = _normalize_duplicate_text(fields.get(FieldName.FAMILY_MEMBER_NAME))
+    facility = _normalize_duplicate_text(fields.get(FieldName.PAYER_FACILITY_NAME))
+    if not facility:
+        facility = _normalize_duplicate_text(fields.get(FieldName.PRESCRIBING_FACILITY_NAME))
+    if not date_text or amount is None or not family_name or not facility:
+        return None
+    return f"{date_text}|{facility}|{family_name}|{amount}"
+
+
+def _normalize_duplicate_text(value: Any) -> str:
+    text = str(value or "").replace("\u3000", " ").strip().lower()
+    if not text:
+        return ""
+    compact = "".join(ch for ch in text if ch.isalnum() or ch in {"-", "_"})
+    return compact
+
+
+def _ocr_guard_scope_user(line_user_id: str) -> str:
+    return f"USER#{line_user_id}"
+
+
+def _ocr_guard_scope_global() -> str:
+    return "GLOBAL"

@@ -28,6 +28,8 @@ class RepositoryFactoryTest(unittest.TestCase):
                         "sessions": "ses",
                         "aggregate_entries": "agg",
                         "family_registry": "fam",
+                        "learning_rules": "learn",
+                        "ocr_usage_guard": "guard",
                     },
                 },
             }

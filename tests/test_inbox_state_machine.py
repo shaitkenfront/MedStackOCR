@@ -18,7 +18,7 @@ from inbox.state_machine import (
 class InboxStateMachineTest(unittest.TestCase):
     def test_initial_state_from_decision(self) -> None:
         self.assertEqual(initial_state_from_decision(DecisionStatus.REVIEW_REQUIRED.value), STATE_AWAIT_CONFIRM)
-        self.assertEqual(initial_state_from_decision(DecisionStatus.AUTO_ACCEPT.value), STATE_COMPLETED)
+        self.assertEqual(initial_state_from_decision(DecisionStatus.AUTO_ACCEPT.value), STATE_AWAIT_CONFIRM)
         self.assertEqual(initial_state_from_decision(DecisionStatus.REJECTED.value), STATE_IDLE)
 
     def test_can_transition(self) -> None:
@@ -30,4 +30,3 @@ class InboxStateMachineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

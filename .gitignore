@@ -45,3 +45,5 @@ Thumbs.db
 # CDK local context (contains secrets)
 infra/cdk/cdk.context.json
 infra/cdk/cdk.out/
+infra/cdk/layers/docai/python/**
+!infra/cdk/layers/docai/python/.gitkeep

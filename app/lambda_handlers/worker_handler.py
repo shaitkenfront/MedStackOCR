@@ -5,7 +5,7 @@ import json
 import os
 import re
 import tempfile
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,12 +13,14 @@ from uuid import uuid4
 
 from app.config import load_config
 from app.pipeline import ReceiptExtractionPipeline
+from core.enums import FieldName
 from inbox.aggregate_service import AggregateService
 from inbox.conversation_service import ConversationService
 from inbox.repository_factory import create_inbox_repository
 from linebot import message_templates
 from linebot.media_client import LineMediaApiClient, guess_extension
 from linebot.reply_client import LineReplyClient
+from ocr.base import OCRAdapterError
 from resolver.year_consistency import apply_year_consistency
 
 try:
@@ -33,6 +35,28 @@ else:
 
 _ENTRY_SPLIT_RE = re.compile(r"[\r\n]+")
 _ALIAS_SPLIT_RE = re.compile(r"[,\u3001\uFF0C/\uFF0F|]+")
+_WHITESPACE_RE = re.compile(r"\s+")
+NON_DEDUCTIBLE_KEYWORDS = (
+    "ワクチン",
+    "予防接種",
+    "健診",
+    "健康診断",
+    "人間ドック",
+    "美容",
+    "診断書",
+    "文書料",
+)
+_CURRENCY_AMOUNT_RE = re.compile(
+    r"(?:[¥￥]\s*(-?(?:\d{1,3}(?:,\d{3})+|\d+)))|(?:(-?(?:\d{1,3}(?:,\d{3})+|\d+))\s*円)"
+)
+_PLAIN_AMOUNT_TOKEN_RE = re.compile(r"(?<!\d)-?(?:\d{1,3}(?:,\d{3})+|\d{1,6})(?!\d)")
+_CANCEL_LAST_REGISTRATION_KEYWORDS = (
+    "取り消し",
+    "取消",
+    "やり直し",
+    "削除",
+    "失敗",
+)
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -67,6 +91,7 @@ class LineEventWorker:
         self.config = config
         self.line_conf = config.get("line_messaging", {})
         self.inbox_conf = config.get("inbox", {})
+        self.ocr_guard_conf = self.inbox_conf.get("ocr_guard", {})
         self.default_household_id = self.line_conf.get("default_household_id")
         self.allowed_user_ids = {
             str(value).strip()
@@ -175,6 +200,10 @@ class LineEventWorker:
 
         if event_type == "postback":
             data = str(event.get("postback", {}).get("data", "") or "")
+            duplicate_messages = self._handle_duplicate_postback(line_user_id=line_user_id, data=data)
+            if duplicate_messages is not None:
+                self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=duplicate_messages)
+                return
             messages = self.conversation_service.handle_postback(line_user_id=line_user_id, data=data)
             self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
             return
@@ -193,18 +222,65 @@ class LineEventWorker:
         extension = guess_extension(content_type)
         receipt_id = str(uuid4())
         image_sha256 = _sha256_hex(content)
+        precheck_duplicates = self.repository.find_potential_duplicates(
+            line_user_id=line_user_id,
+            image_sha256=image_sha256,
+            duplicate_key=None,
+            limit=1,
+        )
+        if precheck_duplicates:
+            self._reply(
+                line_user_id=line_user_id,
+                reply_token=reply_token,
+                messages=message_templates.build_duplicate_image_skipped_message(),
+            )
+            return
+
+        quota_allowed, quota_reason = self.repository.consume_ocr_quota(
+            line_user_id=line_user_id,
+            now_utc=datetime.now(timezone.utc),
+            user_per_minute_limit=_safe_positive_int(self.ocr_guard_conf.get("user_per_minute"), 3),
+            user_per_day_limit=_safe_positive_int(self.ocr_guard_conf.get("user_per_day"), 40),
+            global_per_day_limit=_safe_positive_int(self.ocr_guard_conf.get("global_per_day"), 1200),
+        ) if _is_true(self.ocr_guard_conf.get("enabled", True)) else (True, None)
+        if not quota_allowed:
+            self._reply(
+                line_user_id=line_user_id,
+                reply_token=reply_token,
+                messages=message_templates.build_ocr_quota_exceeded_message(str(quota_reason or "")),
+            )
+            return
+
         image_path = self._persist_raw_image(receipt_id=receipt_id, message_id=message_id, extension=extension, content=content)
 
         temp_path = _write_temp_file(receipt_id=receipt_id, extension=extension, content=content)
         try:
             engine_name = str(self.config.get("ocr", {}).get("engine", "documentai"))
             family_registry_override = self._build_user_family_registry_config(line_user_id)
-            result = self.pipeline.process(
-                image_path=temp_path,
-                household_id=self.default_household_id,
-                ocr_engine=engine_name,
-                family_registry_override=family_registry_override,
+            try:
+                result = self.pipeline.process(
+                    image_path=temp_path,
+                    household_id=self.default_household_id,
+                    ocr_engine=engine_name,
+                    family_registry_override=family_registry_override,
+                )
+            except OCRAdapterError as exc:
+                print(f"ocr-adapter-error line_user_id={line_user_id} message_id={message_id} error={exc}")
+                self._reply(
+                    line_user_id=line_user_id,
+                    reply_token=reply_token,
+                    messages=message_templates.build_ocr_unavailable_message(),
+                )
+                return
+            extracted_fields = _fields_from_result(result)
+            duplicate_key = _build_duplicate_key(extracted_fields)
+            duplicates = self.repository.find_potential_duplicates(
+                line_user_id=line_user_id,
+                image_sha256=image_sha256,
+                duplicate_key=duplicate_key,
+                limit=3,
             )
+            non_deductible_keywords = _detect_non_deductible_keywords(result)
             apply_year_consistency([result], self.config)
             self.repository.save_receipt_result(
                 receipt_id=receipt_id,
@@ -219,6 +295,10 @@ class LineEventWorker:
                 receipt_id=receipt_id,
                 result=result,
             )
+            if duplicates:
+                messages.extend(message_templates.build_duplicate_warning_message(receipt_id=receipt_id, duplicates=duplicates))
+            if non_deductible_keywords:
+                messages.extend(message_templates.build_non_deductible_warning_message(non_deductible_keywords))
             self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
         finally:
             try:
@@ -227,6 +307,11 @@ class LineEventWorker:
                 pass
 
     def _handle_text_event(self, line_user_id: str, reply_token: str, text: str) -> None:
+        if _is_cancel_last_registration_command(text):
+            messages = self._cancel_latest_registration(line_user_id)
+            self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
+            return
+
         enable_text_commands = bool(self.inbox_conf.get("enable_text_commands", True))
         messages: list[dict[str, Any]] | None = None
         if enable_text_commands:
@@ -269,6 +354,14 @@ class LineEventWorker:
                 line_user_id=line_user_id,
                 reply_token=reply_token,
                 messages=message_templates.build_family_registration_prompt_message(),
+            )
+            return
+        invalid_names = _collect_missing_name_separator_canonicals(entries)
+        if invalid_names:
+            self._reply(
+                line_user_id=line_user_id,
+                reply_token=reply_token,
+                messages=message_templates.build_family_registration_need_space_message(invalid_names),
             )
             return
 
@@ -319,6 +412,31 @@ class LineEventWorker:
         local_path = Path(path_text)
         local_path.unlink(missing_ok=True)
         return True
+
+    def _handle_duplicate_postback(self, *, line_user_id: str, data: str) -> list[dict[str, Any]] | None:
+        params = _parse_postback_data(data)
+        action = str(params.get("a", "") or "").strip()
+        receipt_id = str(params.get("r", "") or "").strip()
+        if action == "dup_keep":
+            return message_templates.build_duplicate_kept_message()
+        if action != "dup_del":
+            return None
+        if not receipt_id:
+            return message_templates.build_unknown_message()
+        image_path = self.repository.delete_receipt(line_user_id=line_user_id, receipt_id=receipt_id)
+        if image_path:
+            self._delete_stored_image(image_path)
+        return message_templates.build_duplicate_deleted_message()
+
+    def _cancel_latest_registration(self, line_user_id: str) -> list[dict[str, Any]]:
+        receipt_id = self.repository.get_latest_receipt_id(line_user_id)
+        if not receipt_id:
+            return message_templates.build_last_registration_not_found_message()
+        image_path = self.repository.delete_receipt(line_user_id=line_user_id, receipt_id=receipt_id)
+        if image_path is None:
+            return message_templates.build_last_registration_not_found_message()
+        self._delete_stored_image(image_path)
+        return message_templates.build_last_registration_cancelled_message()
 
     def _persist_raw_image(self, receipt_id: str, message_id: str, extension: str, content: bytes) -> str:
         if self.receipt_bucket:
@@ -379,9 +497,11 @@ def _apply_env_overrides(config: dict[str, Any]) -> None:
     ocr_conf = config.setdefault("ocr", {})
     engines = ocr_conf.setdefault("engines", {})
     docai_conf = engines.setdefault("documentai", {})
+    templates_conf = config.setdefault("templates", {})
     inbox_conf = config.setdefault("inbox", {})
     ddb_conf = inbox_conf.setdefault("dynamodb", {})
     ddb_tables = ddb_conf.setdefault("tables", {})
+    guard_conf = inbox_conf.setdefault("ocr_guard", {})
 
     mapping = {
         "LINE_CHANNEL_SECRET": (line_conf, "channel_secret"),
@@ -401,11 +521,20 @@ def _apply_env_overrides(config: dict[str, Any]) -> None:
         "DDB_SESSIONS_TABLE": (ddb_tables, "sessions"),
         "DDB_AGGREGATE_TABLE": (ddb_tables, "aggregate_entries"),
         "DDB_FAMILY_TABLE": (ddb_tables, "family_registry"),
+        "DDB_LEARNING_TABLE": (ddb_tables, "learning_rules"),
+        "DDB_OCR_GUARD_TABLE": (ddb_tables, "ocr_usage_guard"),
     }
     for env_name, (target, key) in mapping.items():
         value = os.getenv(env_name)
         if value is not None and value != "":
             target[key] = value
+
+    template_store_path = str(os.getenv("TEMPLATE_STORE_PATH", "") or "").strip()
+    if template_store_path:
+        templates_conf["store_path"] = template_store_path
+    elif os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        # Lambda では /var/task が read-only のため、テンプレート保存先を /tmp に寄せる。
+        templates_conf["store_path"] = "/tmp/data/templates"
 
     allowed_ids = os.getenv("LINE_ALLOWED_USER_IDS", "")
     if allowed_ids.strip():
@@ -414,6 +543,15 @@ def _apply_env_overrides(config: dict[str, Any]) -> None:
     backend = os.getenv("INBOX_BACKEND", "").strip().lower()
     if backend:
         inbox_conf["backend"] = backend
+
+    if "OCR_GUARD_ENABLED" in os.environ:
+        guard_conf["enabled"] = _is_true(os.getenv("OCR_GUARD_ENABLED", ""))
+    if os.getenv("OCR_GUARD_USER_PER_MINUTE", "").strip():
+        guard_conf["user_per_minute"] = int(os.getenv("OCR_GUARD_USER_PER_MINUTE", "3"))
+    if os.getenv("OCR_GUARD_USER_PER_DAY", "").strip():
+        guard_conf["user_per_day"] = int(os.getenv("OCR_GUARD_USER_PER_DAY", "40"))
+    if os.getenv("OCR_GUARD_GLOBAL_PER_DAY", "").strip():
+        guard_conf["global_per_day"] = int(os.getenv("OCR_GUARD_GLOBAL_PER_DAY", "1200"))
 
 
 def _apply_secret_overrides(config: dict[str, Any]) -> None:
@@ -538,9 +676,69 @@ def _parse_family_registration_entries(text: str) -> list[tuple[str, list[str]]]
     return entries
 
 
+def _is_cancel_last_registration_command(text: str) -> bool:
+    normalized = _normalize_cancel_command_text(text)
+    if not normalized:
+        return False
+    if normalized in _CANCEL_LAST_REGISTRATION_KEYWORDS:
+        return True
+    if len(normalized) > 12:
+        return False
+    for keyword in _CANCEL_LAST_REGISTRATION_KEYWORDS:
+        if keyword in normalized:
+            return True
+    return False
+
+
+def _normalize_cancel_command_text(text: str) -> str:
+    normalized = str(text or "").replace("\u3000", " ").strip().lower()
+    if not normalized:
+        return ""
+    compact = _WHITESPACE_RE.sub("", normalized)
+    return compact
+
+
+def _is_true(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(value)
+
+
+def _safe_positive_int(value: Any, default: int) -> int:
+    try:
+        resolved = int(value)
+    except Exception:
+        return default
+    return resolved if resolved > 0 else default
+
+
 def _normalize_family_name(value: str) -> str:
     text = str(value or "").replace("\u3000", " ").strip()
-    return " ".join(part for part in text.split(" ") if part)
+    if not text:
+        return ""
+    # 全角/半角スペースを含む連続空白を、半角スペース1個に正規化する。
+    return _WHITESPACE_RE.sub(" ", text)
+
+
+def _collect_missing_name_separator_canonicals(entries: list[tuple[str, list[str]]]) -> list[str]:
+    invalid: list[str] = []
+    for canonical_name, _ in entries:
+        if _has_family_given_space(canonical_name):
+            continue
+        if canonical_name not in invalid:
+            invalid.append(canonical_name)
+    return invalid
+
+
+def _has_family_given_space(name: str) -> bool:
+    normalized = _normalize_family_name(name)
+    if not normalized or " " not in normalized:
+        return False
+    parts = normalized.split(" ")
+    return len(parts) >= 2 and bool(parts[0]) and bool(parts[1])
 
 
 def _dedupe_family_names(values: list[str]) -> list[str]:
@@ -558,6 +756,195 @@ def _dedupe_family_names(values: list[str]) -> list[str]:
     return result
 
 
+def _parse_postback_data(data: str) -> dict[str, str]:
+    parsed = parse_qs(str(data or ""), keep_blank_values=True)
+    output: dict[str, str] = {}
+    for key, values in parsed.items():
+        if not values:
+            continue
+        output[key] = values[0]
+    return output
+
+
+def _fields_from_result(result: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    raw_fields = getattr(result, "fields", {})
+    if not isinstance(raw_fields, dict):
+        return fields
+    for field_name, candidate in raw_fields.items():
+        if candidate is None:
+            continue
+        value = getattr(candidate, "value_normalized", None)
+        if value in (None, ""):
+            value = getattr(candidate, "value_raw", None)
+        fields[str(field_name)] = value
+    return fields
+
+
+def _build_duplicate_key(fields: dict[str, Any]) -> str | None:
+    date_text = _to_date_text(fields.get(FieldName.PAYMENT_DATE))
+    amount = _to_int(fields.get(FieldName.PAYMENT_AMOUNT))
+    family_name = _normalize_duplicate_text(fields.get(FieldName.FAMILY_MEMBER_NAME))
+    facility = _normalize_duplicate_text(fields.get(FieldName.PAYER_FACILITY_NAME))
+    if not facility:
+        facility = _normalize_duplicate_text(fields.get(FieldName.PRESCRIBING_FACILITY_NAME))
+    if not date_text or amount is None or not family_name or not facility:
+        return None
+    return f"{date_text}|{facility}|{family_name}|{amount}"
+
+
+def _normalize_duplicate_text(value: Any) -> str:
+    text = str(value or "").replace("\u3000", " ").strip().lower()
+    if not text:
+        return ""
+    return "".join(ch for ch in text if ch.isalnum() or ch in {"-", "_"})
+
+
+def _detect_non_deductible_keywords(result: Any) -> list[str]:
+    lines = getattr(result, "ocr_lines", [])
+    if not isinstance(lines, list):
+        return []
+
+    found: list[str] = []
+    for line in lines:
+        text = str(getattr(line, "text", "") or "")
+        if not text:
+            continue
+        lowered = text.lower()
+        matched_keywords = [keyword for keyword in NON_DEDUCTIBLE_KEYWORDS if keyword.lower() in lowered]
+        if not matched_keywords:
+            continue
+
+        # 項目名だけの列見出しは誤検知しやすいため、金額の存在を必須条件にする。
+        score = _keyword_line_amount_score(text)
+        if score < 2:
+            score += _same_row_amount_score(lines=lines, target_line=line)
+        if score < 2:
+            continue
+
+        for keyword in matched_keywords:
+            if keyword not in found:
+                found.append(keyword)
+    return found
+
+
+def _keyword_line_amount_score(text: str) -> int:
+    if _extract_currency_positive_amounts(text):
+        return 2
+    if _extract_plain_positive_amounts(text):
+        return 1
+    return 0
+
+
+def _same_row_amount_score(lines: list[Any], target_line: Any) -> int:
+    target_bbox = _to_bbox_tuple(getattr(target_line, "bbox", None))
+    if target_bbox is None:
+        return 0
+    target_page = _to_page_number(target_line)
+    target_x = (target_bbox[0] + target_bbox[2]) / 2.0
+    target_y = (target_bbox[1] + target_bbox[3]) / 2.0
+
+    best = 0
+    for line in lines:
+        if line is target_line:
+            continue
+        if _to_page_number(line) != target_page:
+            continue
+        text = str(getattr(line, "text", "") or "").strip()
+        if not text:
+            continue
+        bbox = _to_bbox_tuple(getattr(line, "bbox", None))
+        if bbox is None:
+            continue
+
+        x = (bbox[0] + bbox[2]) / 2.0
+        y = (bbox[1] + bbox[3]) / 2.0
+        if abs(y - target_y) > 0.03:
+            continue
+        if x <= target_x:
+            continue
+
+        if _extract_currency_positive_amounts(text):
+            return 2
+        if _looks_like_amount_cell_text(text) and _extract_plain_positive_amounts(text):
+            best = max(best, 1)
+    return best
+
+
+def _extract_currency_positive_amounts(text: str) -> list[int]:
+    values: list[int] = []
+    for match in _CURRENCY_AMOUNT_RE.finditer(str(text or "")):
+        token = (match.group(1) or match.group(2) or "").strip()
+        value = _parse_integer_token(token)
+        if value is None or value <= 0:
+            continue
+        values.append(value)
+    return values
+
+
+def _extract_plain_positive_amounts(text: str) -> list[int]:
+    source = str(text or "")
+    values: list[int] = []
+    for match in _PLAIN_AMOUNT_TOKEN_RE.finditer(source):
+        start, end = match.span()
+        before = source[start - 1] if start > 0 else ""
+        after = source[end] if end < len(source) else ""
+        # 日付や時刻など、金額ではない連番を除外する。
+        if before in {"/", ":", "-"} or after in {"/", ":", "-"}:
+            continue
+
+        token = match.group(0).strip()
+        value = _parse_integer_token(token)
+        if value is None or value <= 0:
+            continue
+        # 西暦4桁の単独値は年の可能性が高いため除外する。
+        if len(token.replace(",", "").lstrip("-")) == 4 and 1900 <= value <= 2100:
+            continue
+        values.append(value)
+    return values
+
+
+def _looks_like_amount_cell_text(text: str) -> bool:
+    normalized = str(text or "").replace("\u3000", "").replace(" ", "")
+    if not normalized:
+        return False
+    if "/" in normalized or ":" in normalized:
+        return False
+    if "-" in normalized[1:]:
+        return False
+    return bool(re.fullmatch(r"[¥￥]?-?(?:\d{1,3}(?:,\d{3})+|\d{1,6})円?", normalized))
+
+
+def _parse_integer_token(token: str) -> int | None:
+    normalized = str(token or "").replace(",", "").strip()
+    if not normalized or normalized in {"-", "+", "--"}:
+        return None
+    try:
+        return int(normalized)
+    except ValueError:
+        return None
+
+
+def _to_bbox_tuple(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        x1 = float(value[0])
+        y1 = float(value[1])
+        x2 = float(value[2])
+        y2 = float(value[3])
+    except Exception:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _to_page_number(line: Any) -> int:
+    try:
+        return int(getattr(line, "page", 1) or 1)
+    except Exception:
+        return 1
+
+
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
     parsed = urlparse(str(uri or "").strip())
     if parsed.scheme != "s3":
@@ -565,6 +952,39 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
     bucket = str(parsed.netloc or "").strip()
     key = str(parsed.path or "").lstrip("/")
     return bucket, key
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = "".join(ch for ch in text if ch.isdigit() or ch == "-")
+    if not cleaned or cleaned in {"-", "--"}:
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def _to_date_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "/" in text:
+        parts = text.split("/")
+        if len(parts) == 3:
+            try:
+                return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+            except Exception:
+                return text
+    return text
 
 
 def _write_temp_file(receipt_id: str, extension: str, content: bytes) -> str:

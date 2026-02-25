@@ -23,6 +23,8 @@ def create_inbox_repository(config: dict[str, Any]) -> InboxRepositoryProtocol:
             sessions_table_name=_as_optional_str(tables.get("sessions")),
             aggregate_table_name=_as_optional_str(tables.get("aggregate_entries")),
             family_registry_table_name=_as_optional_str(tables.get("family_registry")),
+            learning_table_name=_as_optional_str(tables.get("learning_rules")),
+            usage_guard_table_name=_as_optional_str(tables.get("ocr_usage_guard")),
             event_ttl_days=int(ddb_conf.get("event_ttl_days", 7)),
         )
 

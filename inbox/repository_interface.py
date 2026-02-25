@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from core.models import ExtractionResult
@@ -66,3 +67,41 @@ class InboxRepositoryProtocol(Protocol):
     def list_family_members(self, line_user_id: str) -> list[dict[str, Any]]: ...
 
     def purge_user_data(self, line_user_id: str) -> list[str]: ...
+
+    def record_field_correction(
+        self,
+        line_user_id: str,
+        field_name: str,
+        context_key: str,
+        corrected_value: Any,
+    ) -> None: ...
+
+    def get_field_correction_hint(
+        self,
+        line_user_id: str,
+        field_name: str,
+        context_key: str,
+        min_count: int = 2,
+    ) -> Any | None: ...
+
+    def find_potential_duplicates(
+        self,
+        line_user_id: str,
+        image_sha256: str,
+        duplicate_key: str | None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_latest_receipt_id(self, line_user_id: str) -> str | None: ...
+
+    def delete_receipt(self, line_user_id: str, receipt_id: str) -> str | None: ...
+
+    def consume_ocr_quota(
+        self,
+        *,
+        line_user_id: str,
+        now_utc: datetime,
+        user_per_minute_limit: int,
+        user_per_day_limit: int,
+        global_per_day_limit: int,
+    ) -> tuple[bool, str | None]: ...

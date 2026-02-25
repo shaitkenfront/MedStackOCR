@@ -1,104 +1,65 @@
 # MedStackOCR MVP
 
-医療費控除向け領収書抽出エンジンの MVP 実装です。  
-このブランチは **LINE Webhook 起動専用** です。
+医療費控除向けの領収書OCR・整理システムです。  
+このブランチは **LINE Webhook + AWS Lambda 本番運用専用** です。
 
-## 主要機能
-- LINE Webhook 経由で画像受付
-- 施設名・日付・金額抽出
-- 家族氏名抽出（LINEユーザーIDごとの family registry + alias）
-- 判定（`AUTO_ACCEPT` / `REVIEW_REQUIRED` / `REJECTED`）
-- 会話型修正フロー（`inbox/`）
+## 概要
+- LINEで受けた領収書画像を Google Document AI でOCR
+- 抽出項目: 医療機関 / 日付 / 金額 / 対象者
+- 判定: `AUTO_ACCEPT` / `REVIEW_REQUIRED` / `REJECTED`
+- 支払日年チェック: システム日付基準で「当年または前年」を許容
+- 会話型修正フローと累計医療費集計を提供
 
-## インストール
-```bash
-pip install -r requirements.txt
-```
+## 構成
+- API Gateway (HTTP API)
+- Lambda (Ingress / Worker の2段)
+- SQS FIFO
+- DynamoDB
+- S3（原本画像）
+- Google Document AI（OCR）
+
+主要実装:
+- `app/lambda_handlers/ingress_handler.py`
+- `app/lambda_handlers/worker_handler.py`
+- `infra/cdk/`
+
+## 主な機能
+- 家族氏名登録（LINEユーザー単位、alias対応）
+- OCR結果の確認・修正・確定
+- 重複候補検知（画像ハッシュ / 項目一致）
+- 訂正履歴に基づく学習ヒント
+- 控除対象外の可能性キーワード検知（注意喚起）
+- ブロック時（`unfollow`）のユーザーデータ削除
+
+## いたずら利用対策
+- OCR実行前に同一画像ハッシュをチェック
+- OCR実行レート制限（既定値）
+  - ユーザー: `3件/分`
+  - ユーザー: `40件/日`
+  - 全体: `1200件/日`
+- 制限超過時はDocAIを呼ばず、LINEに案内メッセージを返却
 
 ## 設定
-1. `config.example.yaml` をコピーして `config.yaml` を作成
-2. `ocr.engines.documentai` を設定
-3. `line_messaging` と `inbox` を設定
-4. DynamoDB運用時は `family_registry.members` は初期値のままで可（実運用はLINE登録フローで保存）
+- 機密値（LINEトークン / DocAI認証情報）は Secrets Manager で管理します。
+- 非機密値は CDK context と Lambda環境変数で管理します。
 
-`documentai` 最低限の設定例:
-```yaml
-ocr:
-  engine: documentai
-  allowed_engines:
-    - documentai
-  engines:
-    documentai:
-      enabled: true
-      project_id: your-gcp-project-id
-      location: us
-      processor_id: your-processor-id
-      credentials_path: C:\\path\\to\\service-account.json
-```
+## デプロイ
+- デプロイ手順は `infra/cdk/README.md` を参照してください。
 
-`line_messaging` 設定例:
-```yaml
-line_messaging:
-  enabled: true
-  channel_secret: "YOUR_LINE_CHANNEL_SECRET"
-  channel_access_token: "YOUR_LINE_CHANNEL_ACCESS_TOKEN"
-  webhook_path: "/webhook/line"
-  api_base_url: "https://api.line.me"
-  data_api_base_url: "https://api-data.line.me"
-  timeout_sec: 10
-  allowed_user_ids: []
-  default_household_id:
-
-inbox:
-  backend: sqlite  # sqlite or dynamodb
-  sqlite_path: "data/inbox/linebot.db"
-  dynamodb:
-    region: ap-northeast-1
-    table_prefix: medstackocr
-    event_ttl_days: 7
-    tables:
-      event_dedupe: medstackocr-line-event-dedupe
-      receipts: medstackocr-receipts
-      receipt_fields: medstackocr-receipt-fields
-      sessions: medstackocr-sessions
-      aggregate_entries: medstackocr-aggregate-entries
-      family_registry: medstackocr-family-registry
-  image_store_dir: "data/inbox/images"
-  image_retention_days: 14
-  session_ttl_minutes: 60
-  max_candidate_options: 3
-  enable_text_commands: true
-```
-
-## 起動（本番）
-- AWS Lambda + API Gateway で起動します（ローカルWebhookサーバーはありません）。
-- デプロイは `infra/cdk/README.md` を参照してください。
-
-## LINEで使えるテキストコマンド
+## LINE操作
+テキストコマンド:
 - `今年の医療費`
 - `今月の医療費`
 - `未確認`
 - `ヘルプ`
+- `取り消し`（類義語: 取消 / やり直し / 削除 / 失敗）
 
 ## 初回オンボーディング
-- 友だち追加（`follow` イベント）時に家族氏名登録フローを開始します。
-- 登録案内: 「ご家族の名前を教えてください。カタカナや、良く間違えられる漢字も登録しておくと認識の精度が上ります。」
-- クイックリプライで `家族氏名の登録を終了` を提示します。
-- `家族氏名の登録を終了` するまで、通常のOCR処理には進みません。
-- ブロック（`unfollow`）時は、そのLINEユーザーに紐づくDB情報と保存画像を削除します。
+- `follow` イベントで家族氏名登録を開始
+- クイックリプライ: `家族氏名の登録を終了`
+- 登録完了まで通常OCR処理に進まない
 
 ## テスト
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
 ```
-
-## 補足
-- `python -m app.main` の CLI モード（`extract` / `batch` など）は廃止済みです。
-- `FastAPI/Uvicorn` のローカルWebhookサーバー運用は廃止済みです。
-- AWS Lambda 2段構成の骨格は以下です。
-  - `app/lambda_handlers/ingress_handler.py`
-  - `app/lambda_handlers/worker_handler.py`
-  - `infra/cdk/`（API Gateway / Lambda / SQS / DynamoDB / S3）
-- 家族氏名辞書は DynamoDB（ユーザーごと）に保存します。
-- CDKのデプロイ手順は `infra/cdk/README.md` を参照してください。
-- 機密値（LINEトークン / DocAI認証情報）は Secrets Manager から実行時に取得する構成です。

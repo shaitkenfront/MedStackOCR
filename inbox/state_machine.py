@@ -15,7 +15,7 @@ def initial_state_from_decision(decision_status: str) -> str:
     if decision_status == DecisionStatus.REVIEW_REQUIRED.value:
         return STATE_AWAIT_CONFIRM
     if decision_status == DecisionStatus.AUTO_ACCEPT.value:
-        return STATE_COMPLETED
+        return STATE_AWAIT_CONFIRM
     return STATE_IDLE
 
 
@@ -33,4 +33,3 @@ def can_transition(current: str, target: str) -> bool:
         STATE_COMPLETED: set(),
     }
     return target in allowed.get(current, set())
-

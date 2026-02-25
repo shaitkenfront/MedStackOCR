@@ -15,10 +15,12 @@ from inbox.repository_interface import InboxRepositoryProtocol
 try:
     import boto3  # type: ignore
     from boto3.dynamodb.conditions import Key  # type: ignore
+    from boto3.dynamodb.types import TypeSerializer  # type: ignore
     from botocore.exceptions import ClientError  # type: ignore
 except Exception as exc:  # pragma: no cover - import guard for local envs
     boto3 = None
     Key = None
+    TypeSerializer = None
     ClientError = Exception
     _BOTO3_IMPORT_ERROR = exc
 else:
@@ -44,6 +46,8 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         sessions_table_name: str | None = None,
         aggregate_table_name: str | None = None,
         family_registry_table_name: str | None = None,
+        learning_table_name: str | None = None,
+        usage_guard_table_name: str | None = None,
         event_ttl_days: int = 7,
         dynamodb_resource: Any | None = None,
     ) -> None:
@@ -59,6 +63,9 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         self._sessions_table = self._ddb.Table(sessions_table_name or f"{normalized_prefix}-sessions")
         self._aggregate_table = self._ddb.Table(aggregate_table_name or f"{normalized_prefix}-aggregate-entries")
         self._family_table = self._ddb.Table(family_registry_table_name or f"{normalized_prefix}-family-registry")
+        self._learning_table = self._ddb.Table(learning_table_name or f"{normalized_prefix}-learning-rules")
+        self._usage_guard_table = self._ddb.Table(usage_guard_table_name or f"{normalized_prefix}-ocr-usage-guard")
+        self._ddb_serializer = TypeSerializer() if TypeSerializer is not None else None
 
     def mark_event_processed(self, event_id: str) -> bool:
         key = (event_id or "").strip()
@@ -93,6 +100,8 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         processing_error: str | None = None,
     ) -> None:
         now = _utc_now()
+        extracted_fields = _extracted_fields_from_result(result)
+        duplicate_key = _build_duplicate_key(extracted_fields)
         self._receipts_table.put_item(
             Item={
                 "receipt_id": receipt_id,
@@ -100,6 +109,7 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
                 "line_message_id": line_message_id,
                 "image_path": image_path,
                 "image_sha256": image_sha256,
+                "duplicate_key": duplicate_key,
                 "document_id": result.document_id,
                 "decision_status": result.decision.status.value,
                 "decision_confidence": _as_decimal(result.decision.confidence),
@@ -532,7 +542,283 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
                         }
                     )
 
+        learning_rules = self._query_learning_rules_by_user(user_id)
+        if learning_rules:
+            with self._learning_table.batch_writer() as batch:
+                for item in learning_rules:
+                    rule_key = str(item.get("rule_key", "")).strip()
+                    if not rule_key:
+                        continue
+                    batch.delete_item(
+                        Key={
+                            "line_user_id": user_id,
+                            "rule_key": rule_key,
+                        }
+                    )
+
+        usage_records = self._query_ocr_guard_records_by_scope(_ocr_guard_scope_user(user_id))
+        if usage_records:
+            with self._usage_guard_table.batch_writer() as batch:
+                for item in usage_records:
+                    scope_key = str(item.get("scope_key", "")).strip()
+                    window_key = str(item.get("window_key", "")).strip()
+                    if not scope_key or not window_key:
+                        continue
+                    batch.delete_item(
+                        Key={
+                            "scope_key": scope_key,
+                            "window_key": window_key,
+                        }
+                    )
+
         return sorted(set(image_paths))
+
+    def record_field_correction(
+        self,
+        line_user_id: str,
+        field_name: str,
+        context_key: str,
+        corrected_value: Any,
+    ) -> None:
+        user_id = str(line_user_id or "").strip()
+        normalized_field = str(field_name or "").strip()
+        normalized_context = _normalize_context_key(context_key)
+        normalized_value = _normalize_learning_value(corrected_value)
+        if not user_id or not normalized_field or not normalized_context or normalized_value is None:
+            return
+        rule_key = _learning_rule_key(normalized_field, normalized_context, normalized_value)
+        now = _utc_now()
+        self._learning_table.update_item(
+            Key={"line_user_id": user_id, "rule_key": rule_key},
+            UpdateExpression=(
+                "SET #field_name = :field_name, #context_key = :context_key, corrected_value = :corrected_value, "
+                "updated_at = :updated_at, created_at = if_not_exists(created_at, :created_at) "
+                "ADD #count :incr"
+            ),
+            ExpressionAttributeNames={
+                "#count": "count",
+                "#field_name": "field_name",
+                "#context_key": "context_key",
+            },
+            ExpressionAttributeValues={
+                ":field_name": normalized_field,
+                ":context_key": normalized_context,
+                ":corrected_value": normalized_value,
+                ":updated_at": now,
+                ":created_at": now,
+                ":incr": 1,
+            },
+        )
+
+    def get_field_correction_hint(
+        self,
+        line_user_id: str,
+        field_name: str,
+        context_key: str,
+        min_count: int = 2,
+    ) -> Any | None:
+        user_id = str(line_user_id or "").strip()
+        normalized_field = str(field_name or "").strip()
+        normalized_context = _normalize_context_key(context_key)
+        threshold = max(1, int(min_count))
+        if not user_id or not normalized_field or not normalized_context:
+            return None
+        rows = self._query_learning_rules_by_prefix(
+            line_user_id=user_id,
+            prefix=f"{normalized_field}#{normalized_context}#",
+        )
+        if not rows:
+            return None
+        best = sorted(
+            rows,
+            key=lambda item: (int(item.get("count", 0) or 0), str(item.get("updated_at", ""))),
+            reverse=True,
+        )[0]
+        if int(best.get("count", 0) or 0) < threshold:
+            return None
+        value = str(best.get("corrected_value", "") or "")
+        if normalized_field == FieldName.PAYMENT_AMOUNT:
+            parsed = _to_int(value)
+            return parsed if parsed is not None else value
+        return value
+
+    def find_potential_duplicates(
+        self,
+        line_user_id: str,
+        image_sha256: str,
+        duplicate_key: str | None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        user_id = str(line_user_id or "").strip()
+        image_hash = str(image_sha256 or "").strip()
+        normalized_key = str(duplicate_key or "").strip()
+        max_items = max(1, int(limit))
+        if not user_id:
+            return []
+
+        rows = self._query_receipts_by_user(
+            user_id,
+            projection="receipt_id, image_sha256, duplicate_key, created_at",
+        )
+        duplicates: list[dict[str, Any]] = []
+        for item in rows:
+            reasons: list[str] = []
+            if image_hash and str(item.get("image_sha256", "") or "") == image_hash:
+                reasons.append("image_sha256")
+            if normalized_key and str(item.get("duplicate_key", "") or "") == normalized_key:
+                reasons.append("fields")
+            if not reasons:
+                continue
+            receipt_id = str(item.get("receipt_id", "") or "").strip()
+            if not receipt_id:
+                continue
+            duplicates.append(
+                {
+                    "receipt_id": receipt_id,
+                    "created_at": str(item.get("created_at", "") or ""),
+                    "reasons": reasons,
+                }
+            )
+            if len(duplicates) >= max_items:
+                break
+        return duplicates
+
+    def get_latest_receipt_id(self, line_user_id: str) -> str | None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return None
+        rows = self._query_receipts_by_user(
+            user_id,
+            projection="receipt_id",
+            scan_index_forward=False,
+            limit=1,
+        )
+        if not rows:
+            return None
+        receipt_id = str(rows[0].get("receipt_id", "") or "").strip()
+        return receipt_id or None
+
+    def consume_ocr_quota(
+        self,
+        *,
+        line_user_id: str,
+        now_utc: datetime,
+        user_per_minute_limit: int,
+        user_per_day_limit: int,
+        global_per_day_limit: int,
+    ) -> tuple[bool, str | None]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return False, "user_minute"
+
+        user_minute_limit = max(1, int(user_per_minute_limit))
+        user_day_limit = max(1, int(user_per_day_limit))
+        global_day_limit = max(1, int(global_per_day_limit))
+        now = now_utc.astimezone(timezone.utc)
+        now_epoch = int(now.timestamp())
+        now_text = now.isoformat()
+        minute_token = now.strftime("%Y%m%d%H%M")
+        day_token = now.strftime("%Y%m%d")
+
+        buckets = [
+            {
+                "scope_key": _ocr_guard_scope_user(user_id),
+                "window_key": f"MIN#{minute_token}",
+                "limit": user_minute_limit,
+                "reason": "user_minute",
+                "expires_at_epoch": now_epoch + 120,
+            },
+            {
+                "scope_key": _ocr_guard_scope_user(user_id),
+                "window_key": f"DAY#{day_token}",
+                "limit": user_day_limit,
+                "reason": "user_day",
+                "expires_at_epoch": now_epoch + 172800,
+            },
+            {
+                "scope_key": _ocr_guard_scope_global(),
+                "window_key": f"DAY#{day_token}",
+                "limit": global_day_limit,
+                "reason": "global_day",
+                "expires_at_epoch": now_epoch + 172800,
+            },
+        ]
+
+        transact_items: list[dict[str, Any]] = []
+        for bucket in buckets:
+            transact_items.append(
+                {
+                    "Update": {
+                        "TableName": self._usage_guard_table.name,
+                        "Key": self._to_ddb_key(
+                            {
+                                "scope_key": bucket["scope_key"],
+                                "window_key": bucket["window_key"],
+                            }
+                        ),
+                        "UpdateExpression": (
+                            "ADD #count :incr "
+                            "SET expires_at_epoch = if_not_exists(expires_at_epoch, :expires), updated_at = :updated_at"
+                        ),
+                        "ConditionExpression": "attribute_not_exists(#count) OR #count < :limit",
+                        "ExpressionAttributeNames": {"#count": "count"},
+                        "ExpressionAttributeValues": self._to_ddb_key(
+                            {
+                                ":incr": 1,
+                                ":limit": int(bucket["limit"]),
+                                ":expires": int(bucket["expires_at_epoch"]),
+                                ":updated_at": now_text,
+                            }
+                        ),
+                    }
+                }
+            )
+
+        client = self._ddb.meta.client
+        try:
+            client.transact_write_items(TransactItems=transact_items)
+            return True, None
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code != "TransactionCanceledException":
+                raise
+            return False, self._detect_ocr_quota_reject_reason(buckets)
+
+    def delete_receipt(self, line_user_id: str, receipt_id: str) -> str | None:
+        user_id = str(line_user_id or "").strip()
+        rid = str(receipt_id or "").strip()
+        if not user_id or not rid:
+            return None
+
+        row = self._receipts_table.get_item(Key={"receipt_id": rid}).get("Item")
+        if row is None:
+            return None
+        if str(row.get("line_user_id", "") or "") != user_id:
+            return None
+
+        image_path = str(row.get("image_path", "") or "").strip() or None
+        self._delete_receipt_fields(rid)
+        self._receipts_table.delete_item(Key={"receipt_id": rid})
+
+        aggregate = self._find_aggregate_by_receipt(rid)
+        if aggregate is not None:
+            self._aggregate_table.delete_item(
+                Key={
+                    "line_user_id": aggregate["line_user_id"],
+                    "service_date_receipt": aggregate["service_date_receipt"],
+                }
+            )
+
+        sessions = self._query_sessions_by_user(user_id)
+        for session in sessions:
+            if str(session.get("receipt_id", "") or "") != rid:
+                continue
+            session_id = str(session.get("session_id", "") or "").strip()
+            if not session_id:
+                continue
+            self._sessions_table.delete_item(Key={"session_id": session_id})
+
+        return image_path
 
     def _query_aggregate_entries(self, *, line_user_id: str, prefix: str | None = None) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {
@@ -552,16 +838,27 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
             kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
         return items
 
-    def _query_receipts_by_user(self, line_user_id: str) -> list[dict[str, Any]]:
+    def _query_receipts_by_user(
+        self,
+        line_user_id: str,
+        projection: str = "receipt_id, image_path",
+        scan_index_forward: bool = True,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {
             "IndexName": "gsi_user_created",
             "KeyConditionExpression": Key("line_user_id").eq(line_user_id),
-            "ProjectionExpression": "receipt_id, image_path",
+            "ProjectionExpression": projection,
+            "ScanIndexForward": scan_index_forward,
         }
+        if limit is not None and limit > 0:
+            kwargs["Limit"] = int(limit)
         items: list[dict[str, Any]] = []
         while True:
             response = self._receipts_table.query(**kwargs)
             items.extend(response.get("Items", []))
+            if limit is not None and limit > 0 and len(items) >= limit:
+                return items[:limit]
             if "LastEvaluatedKey" not in response:
                 break
             kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
@@ -571,7 +868,7 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         kwargs: dict[str, Any] = {
             "IndexName": self.SESSION_USER_UPDATED_INDEX,
             "KeyConditionExpression": Key("line_user_id").eq(line_user_id),
-            "ProjectionExpression": "session_id",
+            "ProjectionExpression": "session_id, receipt_id",
         }
         items: list[dict[str, Any]] = []
         while True:
@@ -595,6 +892,71 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
                 break
             kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
         return items
+
+    def _query_learning_rules_by_user(self, line_user_id: str) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("line_user_id").eq(line_user_id),
+            "ProjectionExpression": "line_user_id, rule_key",
+        }
+        items: list[dict[str, Any]] = []
+        while True:
+            response = self._learning_table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        return items
+
+    def _query_learning_rules_by_prefix(self, *, line_user_id: str, prefix: str) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": (
+                Key("line_user_id").eq(line_user_id)
+                & Key("rule_key").begins_with(prefix)
+            ),
+            "ProjectionExpression": "rule_key, corrected_value, #count, updated_at",
+            "ExpressionAttributeNames": {"#count": "count"},
+        }
+        items: list[dict[str, Any]] = []
+        while True:
+            response = self._learning_table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        return items
+
+    def _query_ocr_guard_records_by_scope(self, scope_key: str) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("scope_key").eq(scope_key),
+            "ProjectionExpression": "scope_key, window_key",
+        }
+        items: list[dict[str, Any]] = []
+        while True:
+            response = self._usage_guard_table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        return items
+
+    def _detect_ocr_quota_reject_reason(self, buckets: list[dict[str, Any]]) -> str:
+        for bucket in buckets:
+            item = self._usage_guard_table.get_item(
+                Key={
+                    "scope_key": bucket["scope_key"],
+                    "window_key": bucket["window_key"],
+                },
+                ConsistentRead=True,
+            ).get("Item")
+            current = int(item.get("count", 0) or 0) if isinstance(item, dict) else 0
+            if current >= int(bucket["limit"]):
+                return str(bucket["reason"])
+        return "global_day"
+
+    def _to_ddb_key(self, value: dict[str, Any]) -> dict[str, Any]:
+        if self._ddb_serializer is None:
+            raise RuntimeError("TypeSerializer is unavailable for DynamoDB transaction")
+        return {key: self._ddb_serializer.serialize(val) for key, val in value.items()}
 
     def _delete_receipt_fields(self, receipt_id: str) -> None:
         kwargs: dict[str, Any] = {
@@ -750,3 +1112,63 @@ def _family_member_record_type(canonical_name: str) -> str:
     normalized = _normalize_family_name(canonical_name).lower().encode("utf-8")
     digest = hashlib.sha256(normalized).hexdigest()[:32]
     return f"MEMBER#{digest}"
+
+
+def _normalize_learning_value(value: Any) -> str | None:
+    text = _to_text(value)
+    if text is None:
+        return None
+    normalized = str(text).strip()
+    return normalized or None
+
+
+def _normalize_context_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _learning_rule_key(field_name: str, context_key: str, corrected_value: str) -> str:
+    digest = hashlib.sha1(corrected_value.encode("utf-8")).hexdigest()
+    return f"{field_name}#{context_key}#{digest}"
+
+
+def _extracted_fields_from_result(result: ExtractionResult) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for field_name, candidate in result.fields.items():
+        if candidate is None:
+            continue
+        value = candidate.value_normalized
+        if value in (None, ""):
+            value = candidate.value_raw
+        output[field_name] = value
+    return output
+
+
+def _build_duplicate_key(fields: dict[str, Any]) -> str | None:
+    date_text = _to_date_text(fields.get(FieldName.PAYMENT_DATE))
+    amount = _to_int(fields.get(FieldName.PAYMENT_AMOUNT))
+    family_name = _normalize_duplicate_text(fields.get(FieldName.FAMILY_MEMBER_NAME))
+    facility = _normalize_duplicate_text(fields.get(FieldName.PAYER_FACILITY_NAME))
+    if not facility:
+        facility = _normalize_duplicate_text(fields.get(FieldName.PRESCRIBING_FACILITY_NAME))
+    if not date_text or amount is None or not family_name or not facility:
+        return None
+    return f"{date_text}|{facility}|{family_name}|{amount}"
+
+
+def _normalize_duplicate_text(value: Any) -> str:
+    text = str(value or "").replace("\u3000", " ").strip().lower()
+    if not text:
+        return ""
+    compact = "".join(ch for ch in text if ch.isalnum() or ch in {"-", "_"})
+    return compact
+
+
+def _ocr_guard_scope_user(line_user_id: str) -> str:
+    return f"USER#{line_user_id}"
+
+
+def _ocr_guard_scope_global() -> str:
+    return "GLOBAL"

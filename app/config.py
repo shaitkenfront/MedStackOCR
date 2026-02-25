@@ -8,7 +8,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "review_threshold": 0.72,
         "reject_threshold": 0.35,
         "candidate_threshold": 2.5,
-        "target_tax_year": None,
         "year_consistency": {
             "enabled": True,
             "min_samples": 5,
@@ -108,7 +107,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "sessions": None,
                 "aggregate_entries": None,
                 "family_registry": None,
+                "learning_rules": None,
+                "ocr_usage_guard": None,
             },
+        },
+        "ocr_guard": {
+            "enabled": True,
+            "user_per_minute": 3,
+            "user_per_day": 40,
+            "global_per_day": 1200,
         },
         "image_store_dir": "data/inbox/images",
         "image_retention_days": 14,

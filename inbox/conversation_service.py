@@ -52,6 +52,11 @@ class ConversationService:
     ) -> list[dict[str, Any]]:
         fields = self._fields_from_result(result)
         candidates = self._candidates_from_result(result)
+        learning_messages = self._apply_learning_hints(
+            line_user_id=line_user_id,
+            receipt_id=receipt_id,
+            fields=fields,
+        )
         decision = result.decision.status.value
 
         if decision == DecisionStatus.AUTO_ACCEPT.value:
@@ -59,10 +64,18 @@ class ConversationService:
                 receipt_id=receipt_id,
                 line_user_id=line_user_id,
                 fields=fields,
-                status="confirmed",
+                status="tentative",
+            )
+            payload = {"fields": fields, "candidates": candidates, "decision": decision}
+            self.repository.upsert_session(
+                line_user_id=line_user_id,
+                receipt_id=receipt_id,
+                state=STATE_AWAIT_CONFIRM,
+                payload=payload,
+                expires_at=self._expires_at(),
             )
             messages = message_templates.build_auto_accept_message(receipt_id=receipt_id, fields=fields)
-            messages.extend(self._build_cumulative_messages(line_user_id))
+            messages.extend(learning_messages)
             return messages
 
         if decision == DecisionStatus.REVIEW_REQUIRED.value:
@@ -72,7 +85,7 @@ class ConversationService:
                 fields=fields,
                 status="tentative",
             )
-            payload = {"fields": fields, "candidates": candidates}
+            payload = {"fields": fields, "candidates": candidates, "decision": decision}
             self.repository.upsert_session(
                 line_user_id=line_user_id,
                 receipt_id=receipt_id,
@@ -80,7 +93,9 @@ class ConversationService:
                 payload=payload,
                 expires_at=self._expires_at(),
             )
-            return message_templates.build_review_required_message(receipt_id=receipt_id, fields=fields)
+            messages = message_templates.build_review_required_message(receipt_id=receipt_id, fields=fields)
+            messages.extend(learning_messages)
+            return messages
 
         self.repository.upsert_aggregate_entry(
             receipt_id=receipt_id,
@@ -171,6 +186,12 @@ class ConversationService:
             fields[field_name] = candidates[index]
             session.payload["fields"] = fields
             self.repository.update_field_value(session.receipt_id, field_name, fields[field_name])
+            self.repository.record_field_correction(
+                line_user_id=line_user_id,
+                field_name=field_name,
+                context_key=self._learning_context_key(fields),
+                corrected_value=fields[field_name],
+            )
             self.repository.upsert_aggregate_entry(
                 receipt_id=session.receipt_id,
                 line_user_id=line_user_id,
@@ -220,10 +241,7 @@ class ConversationService:
                 payload=session.payload,
                 awaiting_field=None,
             )
-            return message_templates.build_review_required_message(
-                receipt_id=session.receipt_id,
-                fields=self._session_fields(session),
-            )
+            return self._build_confirm_prompt_message(session.receipt_id, self._session_fields(session), session.payload)
 
         return message_templates.build_unknown_message()
 
@@ -242,6 +260,12 @@ class ConversationService:
             fields[field_name] = self._normalize_text_value(field_name, normalized)
             session.payload["fields"] = fields
             self.repository.update_field_value(session.receipt_id, field_name, fields[field_name])
+            self.repository.record_field_correction(
+                line_user_id=line_user_id,
+                field_name=field_name,
+                context_key=self._learning_context_key(fields),
+                corrected_value=fields[field_name],
+            )
             self.repository.upsert_aggregate_entry(
                 receipt_id=session.receipt_id,
                 line_user_id=line_user_id,
@@ -416,6 +440,23 @@ class ConversationService:
         session.payload = payload
         session.awaiting_field = awaiting_field
 
+    @staticmethod
+    def _decision_from_payload(payload: dict[str, Any]) -> str:
+        value = payload.get("decision")
+        return str(value) if value is not None else ""
+
+    def _build_confirm_prompt_message(
+        self,
+        receipt_id: str,
+        fields: dict[str, Any],
+        payload: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        data = payload if isinstance(payload, dict) else {}
+        decision = self._decision_from_payload(data)
+        if decision == DecisionStatus.AUTO_ACCEPT.value:
+            return message_templates.build_auto_accept_message(receipt_id=receipt_id, fields=fields)
+        return message_templates.build_review_required_message(receipt_id=receipt_id, fields=fields)
+
     def _expires_at(self) -> str:
         deadline = datetime.now(timezone.utc) + timedelta(minutes=self.session_ttl_minutes)
         return deadline.isoformat()
@@ -433,6 +474,45 @@ class ConversationService:
             current_total, _ = self.repository.get_year_summary(line_user_id, current_year)
             totals.append((current_year, current_total))
         return message_templates.build_yearly_cumulative_message(totals)
+
+    def _apply_learning_hints(
+        self,
+        *,
+        line_user_id: str,
+        receipt_id: str,
+        fields: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        context_key = self._learning_context_key(fields)
+        if not context_key:
+            return []
+
+        field_name = FieldName.FAMILY_MEMBER_NAME
+        hint = self.repository.get_field_correction_hint(
+            line_user_id=line_user_id,
+            field_name=field_name,
+            context_key=context_key,
+            min_count=2,
+        )
+        if hint in (None, ""):
+            return []
+        current = fields.get(field_name)
+        if str(current or "") == str(hint):
+            return []
+        fields[field_name] = hint
+        self.repository.update_field_value(receipt_id, field_name, hint, source="learning_hint")
+        return [
+            {
+                "type": "text",
+                "text": f"過去の訂正履歴を反映しました（対象者: {hint}）。必要なら修正してください。",
+            }
+        ]
+
+    @staticmethod
+    def _learning_context_key(fields: dict[str, Any]) -> str:
+        facility = str(fields.get(FieldName.PAYER_FACILITY_NAME, "") or "").strip()
+        if not facility:
+            facility = str(fields.get(FieldName.PRESCRIBING_FACILITY_NAME, "") or "").strip()
+        return facility
 
     @staticmethod
     def _normalize_text_value(field_name: str, value: str) -> Any:

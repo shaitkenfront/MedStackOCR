@@ -16,20 +16,18 @@ def apply_year_consistency(results: list[ExtractionResult], config: dict[str, An
     if not policy["enabled"]:
         return
 
-    target_tax_year = policy["target_tax_year"]
-    if target_tax_year is not None:
-        _apply_with_target_year(results, target_tax_year)
-        return
-
+    _apply_with_system_year_window(results)
     _apply_with_dominant_year(results, policy)
 
 
-def _apply_with_target_year(results: list[ExtractionResult], target_year: int) -> None:
+def _apply_with_system_year_window(results: list[ExtractionResult]) -> None:
+    current_year = datetime.now().year
+    previous_year = current_year - 1
     for result in results:
         year, _ = _extract_payment_year_and_weight(result, weight_by_confidence=True)
-        if year is None or year == target_year:
+        if year is None or year in {current_year, previous_year}:
             continue
-        reason = f"year_mismatch_target_tax_year:target={target_year}:doc={year}"
+        reason = f"year_out_of_current_or_previous:allowed={previous_year}|{current_year}:doc={year}"
         _force_review_required(result, reason)
 
 
@@ -113,23 +111,9 @@ def _load_policy(config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(year_conf, dict):
         year_conf = {}
 
-    target_tax_year = _parse_optional_int(pipeline.get("target_tax_year"))
     return {
         "enabled": bool(year_conf.get("enabled", True)),
         "min_samples": int(year_conf.get("min_samples", 5)),
         "dominant_ratio_threshold": float(year_conf.get("dominant_ratio_threshold", 0.65)),
         "weight_by_confidence": bool(year_conf.get("weight_by_confidence", True)),
-        "target_tax_year": target_tax_year,
     }
-
-
-def _parse_optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None

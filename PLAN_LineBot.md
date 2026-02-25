@@ -397,3 +397,43 @@ ocr:
 7. 集計コマンドは `今年の医療費` / `今月の医療費` / `未確認` / `ヘルプ` で確定してよいか  
 
 この 7 項目が確定したら「不明点ゼロ」とし、実装フェーズに進む。
+
+---
+
+## 15. 追加実装仕様（2026-02）
+
+### 15.1 訂正学習
+
+- DynamoDB `learning-rules` テーブルを追加する  
+  - PK: `line_user_id`  
+  - SK: `rule_key` (`field_name#context_hash#value_hash`)  
+  - 属性: `field_name`, `context_key`, `corrected_value`, `count`, `created_at`, `updated_at`
+- 学習記録トリガー: ユーザーが `REVIEW_REQUIRED` で修正確定したとき
+  - 対象操作: 候補選択 (`a=pick`) / 手入力 (`a=free_text`)
+- 学習適用ロジック:
+  - コンテキスト: 医療機関名
+  - 対象フィールド: `family_member_name`
+  - 同一コンテキストで同一訂正が `count>=2` の場合、次回抽出時にヒント適用
+  - LINE文面: 「過去の訂正履歴を反映しました（対象者: ...）。必要なら修正してください。」
+
+### 15.2 重複検出・削除
+
+- 重複キー: `payment_date|facility|family_member|amount`（正規化）
+- 検出条件:
+  - `image_sha256` 一致
+  - 重複キー一致
+- 返信:
+  - 重複警告メッセージ + クイックリプライ  
+    - `今回を削除` (`a=dup_del&r=<receipt_id>`)  
+    - `このまま登録` (`a=dup_keep&r=<receipt_id>`)
+- `dup_del` 実行時:
+  - receipts / receipt_fields / aggregate / session から対象伝票を削除
+  - 画像を S3 またはローカルから削除
+
+### 15.3 控除対象外の可能性警告
+
+- OCR行テキストに以下キーワードが含まれる場合に注意喚起:
+  - `ワクチン`, `予防接種`, `健診`, `健康診断`, `人間ドック`, `美容`, `診断書`, `文書料`
+- 判定の自動除外はしない（ユーザー最終判断）
+- LINE文面:
+  - 「医療費控除対象外の可能性がある語句を検出しました...最終的な控除可否は領収書内容と税務要件を確認してください。」

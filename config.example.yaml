@@ -2,7 +2,6 @@ pipeline:
   review_threshold: 0.72
   reject_threshold: 0.35
   candidate_threshold: 2.5
-  target_tax_year: 2026
   year_consistency:
     enabled: true
     min_samples: 5
@@ -103,6 +102,13 @@ inbox:
       sessions:
       aggregate_entries:
       family_registry:
+      learning_rules:
+      ocr_usage_guard:
+  ocr_guard:
+    enabled: true
+    user_per_minute: 3
+    user_per_day: 40
+    global_per_day: 1200
   image_store_dir: data/inbox/images
   image_retention_days: 14
   session_ttl_minutes: 60

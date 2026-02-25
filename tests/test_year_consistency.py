@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 
 from core.enums import DecisionStatus, DocumentType, FieldName
 from core.models import AuditInfo, Candidate, Decision, ExtractionResult, TemplateMatch
@@ -38,26 +39,30 @@ def _build_result(name: str, date_value: str, status: DecisionStatus = DecisionS
 
 
 class YearConsistencyTest(unittest.TestCase):
-    def test_target_tax_year_overrides_majority(self) -> None:
+    def test_out_of_current_or_previous_year_marks_review(self) -> None:
+        current_year = datetime.now().year
+        previous_year = current_year - 1
         results = [
-            _build_result("doc1", "2025-01-10"),
-            _build_result("doc2", "2025-02-11"),
-            _build_result("doc3", "2024-03-12"),
+            _build_result("doc1", f"{current_year}-01-10"),
+            _build_result("doc2", f"{previous_year}-02-11"),
+            _build_result("doc3", f"{previous_year - 1}-03-12"),
         ]
-        config = {"pipeline": {"target_tax_year": 2025}}
+        config = {"pipeline": {"year_consistency": {"enabled": True}}}
         apply_year_consistency(results, config)
         self.assertEqual(results[0].decision.status, DecisionStatus.AUTO_ACCEPT)
         self.assertEqual(results[1].decision.status, DecisionStatus.AUTO_ACCEPT)
         self.assertEqual(results[2].decision.status, DecisionStatus.REVIEW_REQUIRED)
-        self.assertTrue(any("year_mismatch_target_tax_year" in r for r in results[2].decision.reasons))
+        self.assertTrue(any("year_out_of_current_or_previous" in r for r in results[2].decision.reasons))
 
     def test_dominant_year_marks_outlier(self) -> None:
+        current_year = datetime.now().year
+        previous_year = current_year - 1
         results = [
-            _build_result("doc1", "2025-01-10"),
-            _build_result("doc2", "2025-02-11"),
-            _build_result("doc3", "2025-03-12"),
-            _build_result("doc4", "2024-03-12"),
-            _build_result("doc5", "2025-04-12"),
+            _build_result("doc1", f"{current_year}-01-10"),
+            _build_result("doc2", f"{current_year}-02-11"),
+            _build_result("doc3", f"{current_year}-03-12"),
+            _build_result("doc4", f"{previous_year}-03-12"),
+            _build_result("doc5", f"{current_year}-04-12"),
         ]
         config = {
             "pipeline": {
@@ -78,12 +83,14 @@ class YearConsistencyTest(unittest.TestCase):
         self.assertTrue(any("year_outlier_against_batch" in r for r in results[3].decision.reasons))
 
     def test_ratio_not_enough_then_no_change(self) -> None:
+        current_year = datetime.now().year
+        previous_year = current_year - 1
         results = [
-            _build_result("doc1", "2025-01-10"),
-            _build_result("doc2", "2025-02-11"),
-            _build_result("doc3", "2024-03-12"),
-            _build_result("doc4", "2024-04-13"),
-            _build_result("doc5", "2025-05-14"),
+            _build_result("doc1", f"{current_year}-01-10"),
+            _build_result("doc2", f"{current_year}-02-11"),
+            _build_result("doc3", f"{previous_year}-03-12"),
+            _build_result("doc4", f"{previous_year}-04-13"),
+            _build_result("doc5", f"{current_year}-05-14"),
         ]
         config = {
             "pipeline": {
@@ -99,11 +106,13 @@ class YearConsistencyTest(unittest.TestCase):
         self.assertTrue(all(r.decision.status == DecisionStatus.AUTO_ACCEPT for r in results))
 
     def test_rejected_status_is_not_downgraded(self) -> None:
-        kept_rejected = _build_result("doc_rej", "2024-01-01", status=DecisionStatus.REJECTED)
-        normal = _build_result("doc_ok", "2025-01-01")
-        normal2 = _build_result("doc_ok2", "2025-02-01")
-        normal3 = _build_result("doc_ok3", "2025-03-01")
-        normal4 = _build_result("doc_ok4", "2025-04-01")
+        current_year = datetime.now().year
+        previous_year = current_year - 1
+        kept_rejected = _build_result("doc_rej", f"{previous_year}-01-01", status=DecisionStatus.REJECTED)
+        normal = _build_result("doc_ok", f"{current_year}-01-01")
+        normal2 = _build_result("doc_ok2", f"{current_year}-02-01")
+        normal3 = _build_result("doc_ok3", f"{current_year}-03-01")
+        normal4 = _build_result("doc_ok4", f"{current_year}-04-01")
         results = [kept_rejected, normal, normal2, normal3, normal4]
         config = {
             "pipeline": {

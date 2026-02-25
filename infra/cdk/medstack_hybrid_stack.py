@@ -175,6 +175,45 @@ class MedstackHybridStack(Stack):
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
             encryption_key=family_registry_key,
         )
+        learning_rules_table = dynamodb.Table(
+            self,
+            "LearningRulesTable",
+            table_name=f"{prefix}-learning-rules",
+            partition_key=dynamodb.Attribute(name="line_user_id", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="rule_key", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            point_in_time_recovery=True,
+            removal_policy=RemovalPolicy.RETAIN,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=family_registry_key,
+        )
+        ocr_usage_guard_table = dynamodb.Table(
+            self,
+            "OcrUsageGuardTable",
+            table_name=f"{prefix}-ocr-usage-guard",
+            partition_key=dynamodb.Attribute(name="scope_key", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="window_key", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+            time_to_live_attribute="expires_at_epoch",
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=family_registry_key,
+        )
+
+        docai_layer_asset_path = Path(__file__).resolve().parent / "layers" / "docai"
+        if not (docai_layer_asset_path / "python").exists():
+            raise FileNotFoundError(
+                "DocAI layer asset is missing. "
+                "Run `powershell -File infra/cdk/scripts/build_docai_layer.ps1` before `cdk deploy`."
+            )
+        docai_dependencies_layer = lambda_.LayerVersion(
+            self,
+            "DocAiDependenciesLayer",
+            layer_version_name=f"{prefix}-docai-deps",
+            code=lambda_.Code.from_asset(str(docai_layer_asset_path)),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
+            description="Dependencies for Google Document AI client",
+        )
 
         lambda_asset_path = str(Path(__file__).resolve().parents[2])
         lambda_asset_excludes = [
@@ -222,6 +261,7 @@ class MedstackHybridStack(Stack):
             code=lambda_.Code.from_asset(lambda_asset_path, exclude=lambda_asset_excludes),
             timeout=Duration.seconds(90),
             memory_size=1536,
+            layers=[docai_dependencies_layer],
             environment={
                 "CONFIG_PATH": config_path,
                 "INBOX_BACKEND": "dynamodb",
@@ -232,6 +272,8 @@ class MedstackHybridStack(Stack):
                 "DDB_SESSIONS_TABLE": sessions_table.table_name,
                 "DDB_AGGREGATE_TABLE": aggregate_entries_table.table_name,
                 "DDB_FAMILY_TABLE": family_registry_table.table_name,
+                "DDB_LEARNING_TABLE": learning_rules_table.table_name,
+                "DDB_OCR_GUARD_TABLE": ocr_usage_guard_table.table_name,
                 "RECEIPT_BUCKET": receipt_bucket.bucket_name,
                 "RECEIPT_PREFIX": receipt_prefix,
                 "APP_SECRETS_ARN": app_secret.secret_arn if app_secret else "",
@@ -239,6 +281,11 @@ class MedstackHybridStack(Stack):
                 "DOC_AI_PROJECT_ID": docai_project_id,
                 "DOC_AI_LOCATION": docai_location,
                 "DOC_AI_PROCESSOR_ID": docai_processor_id,
+                "TEMPLATE_STORE_PATH": "/tmp/data/templates",
+                "OCR_GUARD_ENABLED": "true",
+                "OCR_GUARD_USER_PER_MINUTE": "3",
+                "OCR_GUARD_USER_PER_DAY": "40",
+                "OCR_GUARD_GLOBAL_PER_DAY": "1200",
             },
         )
         worker_fn.add_event_source(
@@ -258,6 +305,8 @@ class MedstackHybridStack(Stack):
         sessions_table.grant_read_write_data(worker_fn)
         aggregate_entries_table.grant_read_write_data(worker_fn)
         family_registry_table.grant_read_write_data(worker_fn)
+        learning_rules_table.grant_read_write_data(worker_fn)
+        ocr_usage_guard_table.grant_read_write_data(worker_fn)
         receipt_bucket.grant_read_write(worker_fn)
         if app_secret is not None:
             app_secret.grant_read(ingress_fn)
@@ -281,3 +330,6 @@ class MedstackHybridStack(Stack):
         CfnOutput(self, "LineEventsQueueUrl", value=line_events_queue.queue_url)
         CfnOutput(self, "ReceiptBucketName", value=receipt_bucket.bucket_name)
         CfnOutput(self, "FamilyRegistryTableName", value=family_registry_table.table_name)
+        CfnOutput(self, "LearningRulesTableName", value=learning_rules_table.table_name)
+        CfnOutput(self, "OcrUsageGuardTableName", value=ocr_usage_guard_table.table_name)
+        CfnOutput(self, "DocAiDependenciesLayerArn", value=docai_dependencies_layer.layer_version_arn)

@@ -8,7 +8,6 @@ from typing import Any
 class TemplateStore:
     def __init__(self, root_path: str) -> None:
         self.root = Path(root_path)
-        self.root.mkdir(parents=True, exist_ok=True)
 
     def load_household_templates(
         self, household_id: str, document_type: str | None = None
