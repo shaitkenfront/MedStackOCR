@@ -1,629 +1,399 @@
-# PLAN.md — 医療費領収書集計Bot（LINE起点 / ルールベース確認フロー MVP）
+# PLAN_LineBot.md — Google Document AI OCR x LINE Messaging API「医療費の会話型インボックス」MVP
 
-## 0. 目的
+## 0. この計画の前提（現行プロジェクト整合）
 
-LINEで送られた医療費領収書画像をOCRで読み取り、  
-**会話ベース（LINE内）で最小限の確認を行いながら** 年間医療費を集計できるMVPを作る。
+この計画は、既存の `MedStackOCR` コードベースを作り直さずに拡張する前提です。
 
-- 入口UX: **LINEで写真を送るだけ**
-- 確認UX: **原則LINE内で完結（クイックリプライ中心）**
-- 軽量LLM: **現段階では使わない**（将来拡張）
-- Web UI: **今回は必須にしない**（将来の逃げ道として設計だけ意識）
-
----
-
-## 1. MVPのスコープ
-
-### ✅ MVPでやること
-- LINE Botで画像メッセージ受信
-- 画像保存（短期）
-- OCR実行（OCRアダプタは抽象化）
-- 項目抽出（最低4項目）
-  - 医療機関名
-  - 日付
-  - 金額
-  - 対象者（本人/家族）
-- ルールベースで判定
-  - `AUTO_ACCEPT`
-  - `REVIEW_REQUIRED`
-  - `REJECTED`
-- LINEの会話フローで確認/修正（クイックリプライ）
-- DB保存（領収書、抽出結果、会話状態、集計）
-- 年間集計の取得（LINEコマンド）
-
-### ❌ MVPでやらないこと
-- 軽量LLMによる自然言語理解
-- Web確認UI（LIFF含む）
-- 自動学習（ML再学習）
-- 税務申告書類の出力
-- 複雑な明細行解析（診療明細の行単位）
+- 既存の主軸は CLI パイプライン (`app/main.py`, `app/pipeline.py`)
+- OCR は adapter 抽象化済みで、`ocr/documentai_adapter.py` が既に実装済み
+- 抽出・判定ロジックは既存実装を利用
+  - `FieldName`: `payer_facility_name`, `prescribing_facility_name`, `payment_date`, `payment_amount`, `family_member_name`
+  - `DecisionStatus`: `AUTO_ACCEPT`, `REVIEW_REQUIRED`, `REJECTED`
+- LINE 送信は通知用途として `notifications/channels.py` に Push 実装済み（会話用 Reply API は未実装）
+- 今回は「新規プロダクトを別実装」ではなく「既存エンジンに LINE 会話層を追加」する
 
 ---
 
-## 2. UX要件（最重要）
+## 1. 目的
 
-### UX原則
-1. **入力はLINEで完結**（写真送信）
-2. **確認は1ターン1判断**
-3. **ボタン選択を優先**（自由入力は最終手段）
-4. **怪しい時だけ確認**
-5. **保留できる**
-6. **仮登録を許す**（後で確定可能）
+LINE で受信した医療費領収書画像を Google Document AI OCR で処理し、LINE 内の会話で確認・修正しながら登録できる MVP を作る。
 
-### メッセージ状態
-- `AUTO_ACCEPT`
-  - 例: `〇〇薬局 / 1,540円 / 2026-02-25 で登録しました`
-  - クイックリプライ: `修正する`, `保留`
-- `REVIEW_REQUIRED`
-  - 例: `金額の候補を確認してください`
-  - クイックリプライ: 候補値, `修正する`, `保留`
-- `REJECTED`
-  - 例: `読み取れませんでした。明るい場所で再撮影してください`
-  - クイックリプライ: `撮り直すコツ`, `手入力する`（MVPでは手入力簡易対応でも可）
+- 入口: LINE で画像送信
+- 抽出: 既存 `ReceiptExtractionPipeline` を再利用
+- 判定: 既存 `AUTO_ACCEPT / REVIEW_REQUIRED / REJECTED` をそのまま利用
+- 会話: クイックリプライ中心で確定/修正/保留
+- 集計: LINE コマンドで月次/年次合計を返す
 
 ---
 
-## 3. システム構成（MVP）
+## 2. MVP スコープ
 
-### 推奨構成（AWS想定）
-- **LINE Webhook API**（FastAPI or Lambda）
-- **画像保存**（S3）
-- **OCR Worker**（同期でも可 / 将来非同期化しやすく）
-- **DB**（SQLiteで開始 → 将来DynamoDB/RDS）
-- **LINE Reply/Push API**
-- **Secrets管理**（ローカル `.env` はダミーのみ、本番はSecrets Manager想定）
+### 実装する
 
-### アーキテクチャ方針
-- OCRエンジンは **adapter interface** で抽象化
-- 抽出ロジックは OCRと分離（`extractor`）
-- 会話状態管理を独立（`conversation`）
-- メッセージ文面はテンプレ管理（ハードコードしない）
+- LINE Webhook 受信（署名検証込み）
+- 画像メッセージの取得・一時保存
+- `ocr_engine=documentai` で既存 pipeline 実行
+- 抽出結果を SQLite に保存
+- 会話セッション管理（修正・保留・確定）
+- LINE Reply API / Push API 送信
+- 集計コマンド（`今年の医療費`, `今月の医療費`, `未確認`, `ヘルプ`）
+
+### 今回はやらない
+
+- LLM による自由入力の高度解釈
+- Web UI / LIFF
+- 複雑明細（行明細の自動構造化）
+- マルチテナント運用
 
 ---
 
-## 4. リポジトリ構成（提案）
+## 3. 全体アーキテクチャ（現行整合版）
+
+```text
+LINE User
+  -> LINE Messaging API (Webhook)
+  -> app/line_webhook.py (FastAPI)
+  -> linebot/webhook_handler.py
+  -> linebot/media_client.py (message content download)
+  -> app/pipeline.py ReceiptExtractionPipeline (documentai固定)
+  -> inbox/repository.py (SQLite保存)
+  -> inbox/conversation_service.py (状態遷移)
+  -> linebot/reply_client.py (Reply/Push)
+  -> LINE User
+```
+
+ポイント:
+
+- 抽出ロジックは既存の `extractors/`, `resolver/`, `templates/` を流用
+- `app/main.py` の CLI は残す（運用/検証用）
+- LINE 会話層は新規モジュールとして分離し、既存 CLI への影響を最小化
+
+---
+
+## 4. 追加するモジュール構成（提案）
 
 ```text
 app/
-  main.py                       # FastAPI entry (webhook)
-  config.py                     # 設定読み込み（env）
-  logging.py                    # マスキング対応logger
-  dependencies.py
-
-core/
-  models.py                     # dataclass / Pydantic models
-  enums.py                      # Status/State enums
-  errors.py
-  time.py
-  ids.py
+  line_webhook.py              # FastAPI entrypoint（新規）
 
 linebot/
-  webhook_handler.py            # LINEイベント入口
-  reply.py                      # reply/push wrapper
-  message_templates.py          # メッセージテンプレ
-  quick_replies.py              # クイックリプライ生成
+  webhook_handler.py           # イベント入口・署名検証後の振り分け（新規）
+  media_client.py              # LINE画像取得APIクライアント（新規）
+  reply_client.py              # LINE Reply/Push API クライアント（新規）
+  message_templates.py         # 返信文面テンプレート（新規）
+  quick_replies.py             # quick reply/postback data 生成（新規）
+  signature.py                 # X-Line-Signature 検証（新規）
 
-ocr/
-  base.py                       # OCR adapter interface
-  mock_adapter.py               # 開発用ダミー
-  adapter_xxx.py                # 実OCR実装（後で差し替え）
-  normalizer.py                 # OCR文字正規化（全角半角、円、日付）
-
-extract/
-  receipt_extractor.py          # OCR結果から候補抽出
-  rule_engine.py                # AUTO_ACCEPT / REVIEW_REQUIRED / REJECTED 判定
-  candidate_builder.py          # 候補生成（特に金額/日付/医療機関名）
-
-conversation/
-  state_machine.py              # 状態遷移
-  handlers.py                   # ユーザー返信ごとの処理
-  intents.py                    # ルールベース意図判定（OK/修正/保留等）
-  session_store.py              # 会話セッション管理
-
-domain/
-  receipt_service.py            # 登録・修正・確定
-  aggregate_service.py          # 年間集計
-  user_profile_service.py       # 対象者（本人/家族）など
-
-infra/
-  storage/
-    image_store.py              # 画像保存/取得/削除
-  db/
-    repositories.py             # CRUD
-    schema.sql                  # 初期スキーマ（SQLite）
-  queue/                        # 将来用（非同期化）
-    jobs.py
+inbox/
+  models.py                    # DB行モデル/DTO（新規）
+  repository.py                # SQLite CRUD（新規）
+  state_machine.py             # 会話状態遷移（新規）
+  conversation_service.py      # 受信イベント処理と返信決定（新規）
+  aggregate_service.py         # 集計コマンド処理（新規）
+  retention.py                 # TTL削除処理（新規）
 
 tests/
-  test_rule_engine.py
-  test_extractor.py
-  test_conversation_flow.py
-  test_intents.py
-  test_normalizer.py
+  test_line_signature.py
+  test_line_webhook_handler.py
+  test_inbox_state_machine.py
+  test_inbox_repository.py
+  test_conversation_service.py
+  test_line_message_templates.py
+```
 
-scripts/
-  seed_mock_data.py
-  run_local.sh
+既存モジュールの変更想定:
 
-docs/
-  API.md
-  MESSAGE_FLOW.md
-  SECURITY.md
-````
+- `app/config.py`: LINE webhook/inbox 設定追加
+- `config.example.yaml`: 新規設定例追加
+- `requirements.txt`: `fastapi`, `uvicorn` 追加
+- `.gitignore`: `data/inbox/images/` と SQLite ファイル追加
 
 ---
 
-## 5. データモデル（MVP）
+## 5. 設定仕様（追加）
 
-## 5.1 Receipt（領収書）
+`config.yaml` に以下を追加する。
 
-```python
-Receipt:
-  receipt_id: str
-  user_id: str                  # LINE userId を内部IDに変換して保持
-  image_uri: str                # 保存先（短期）
-  image_sha256: str
-  ocr_status: str               # pending / done / failed
-  review_status: str            # auto_accepted / review_required / rejected / confirmed / hold
-  created_at: datetime
-  updated_at: datetime
+```yaml
+line_messaging:
+  enabled: true
+  channel_secret: ""
+  channel_access_token: ""
+  webhook_path: "/webhook/line"
+  api_base_url: "https://api.line.me"
+  data_api_base_url: "https://api-data.line.me"
+  timeout_sec: 10
+  allowed_user_ids: []
+
+inbox:
+  sqlite_path: "data/inbox/linebot.db"
+  image_store_dir: "data/inbox/images"
+  image_retention_days: 14
+  session_ttl_minutes: 60
+  max_candidate_options: 3
+  enable_text_commands: true
 ```
 
-## 5.2 ExtractedFields（抽出結果）
+Document AI 運用の前提:
 
-```python
-ExtractedFields:
-  receipt_id: str
-
-  provider_name_value: str | None
-  provider_name_confidence: float | None
-  provider_name_candidates: list[str]
-  provider_name_source_text: str | None
-
-  amount_value: int | None
-  amount_confidence: float | None
-  amount_candidates: list[int]
-  amount_source_text: str | None
-
-  date_value: date | None
-  date_confidence: float | None
-  date_candidates: list[str]
-  date_source_text: str | None
-
-  person_value: str | None      # self / spouse / child / other
-  person_confidence: float | None
-  person_candidates: list[str]
-
-  raw_ocr_text: str | None      # 長期保存しない方針（MVPでもTTLを意識）
-```
-
-## 5.3 ConversationSession（会話状態）
-
-```python
-ConversationSession:
-  session_id: str
-  user_id: str
-  receipt_id: str
-  state: str                    # enum (後述)
-  awaiting_field: str | None    # amount/date/provider_name/person
-  candidate_payload_json: str | None
-  expires_at: datetime
-  created_at: datetime
-  updated_at: datetime
-```
-
-## 5.4 AggregateEntry（集計レコード）
-
-```python
-AggregateEntry:
-  entry_id: str
-  receipt_id: str
-  user_id: str
-  service_date: date
-  provider_name: str
-  amount_yen: int
-  person: str
-  status: str                   # tentative / confirmed / hold
-  created_at: datetime
-  updated_at: datetime
+```yaml
+ocr:
+  engine: documentai
+  allowed_engines:
+    - documentai
+  engines:
+    documentai:
+      enabled: true
+      project_id: "YOUR_GCP_PROJECT"
+      location: "us"
+      processor_id: "YOUR_PROCESSOR_ID"
+      credentials_path: "C:\\path\\to\\service-account.json"
 ```
 
 ---
 
-## 6. 状態遷移設計（ルールベース会話）
+## 6. DB スキーマ（SQLite MVP）
 
-## 6.1 OCR判定状態（抽出後）
+### `receipts`
 
-* `AUTO_ACCEPT`
-* `REVIEW_REQUIRED`
-* `REJECTED`
+- `receipt_id` TEXT PK
+- `line_user_id` TEXT NOT NULL
+- `line_message_id` TEXT NOT NULL
+- `image_path` TEXT NOT NULL
+- `image_sha256` TEXT NOT NULL
+- `document_id` TEXT
+- `decision_status` TEXT NOT NULL
+- `decision_confidence` REAL NOT NULL
+- `processing_error` TEXT
+- `created_at` TEXT NOT NULL
+- `updated_at` TEXT NOT NULL
 
-## 6.2 会話セッション状態（LINE返信処理）
+### `receipt_fields`
 
-* `IDLE`
-* `AWAIT_CONFIRM`              # 「この内容で登録？」待ち
-* `AWAIT_FIELD_SELECTION`      # 「どれを修正？」待ち
-* `AWAIT_FIELD_CANDIDATE`      # 候補選択待ち
-* `AWAIT_FREE_TEXT`            # 自由入力待ち（MVPは最小限）
-* `COMPLETED`
-* `HOLD`
-* `CANCELLED`
+- `receipt_id` TEXT NOT NULL
+- `field_name` TEXT NOT NULL
+- `value_raw` TEXT
+- `value_normalized` TEXT
+- `score` REAL
+- `ocr_confidence` REAL
+- `reasons_json` TEXT
+- `source` TEXT
+- PK: (`receipt_id`, `field_name`)
 
-## 6.3 基本フロー
+### `conversation_sessions`
+
+- `session_id` TEXT PK
+- `line_user_id` TEXT NOT NULL
+- `receipt_id` TEXT NOT NULL
+- `state` TEXT NOT NULL
+- `awaiting_field` TEXT
+- `payload_json` TEXT
+- `expires_at` TEXT NOT NULL
+- `created_at` TEXT NOT NULL
+- `updated_at` TEXT NOT NULL
+
+### `aggregate_entries`
+
+- `entry_id` TEXT PK
+- `receipt_id` TEXT UNIQUE NOT NULL
+- `line_user_id` TEXT NOT NULL
+- `service_date` TEXT
+- `provider_name` TEXT
+- `amount_yen` INTEGER
+- `family_member_name` TEXT
+- `status` TEXT NOT NULL  # tentative / confirmed / hold
+- `created_at` TEXT NOT NULL
+- `updated_at` TEXT NOT NULL
+
+### `processed_line_events`（冪等性）
+
+- `event_id` TEXT PK
+- `received_at` TEXT NOT NULL
+
+---
+
+## 7. 会話状態機械（MVP）
+
+状態:
+
+- `IDLE`
+- `AWAIT_CONFIRM`
+- `AWAIT_FIELD_SELECTION`
+- `AWAIT_FIELD_CANDIDATE`
+- `AWAIT_FREE_TEXT`
+- `HOLD`
+- `COMPLETED`
+
+遷移の基本:
 
 1. 画像受信
 2. OCR + 抽出 + 判定
-3. 判定に応じてメッセージ送信
-4. ユーザー返信（ボタン/テキスト）
-5. セッション状態に応じて遷移
-6. 確定 or 保留
+3. `AUTO_ACCEPT`: 登録して完了通知（修正導線を付与）
+4. `REVIEW_REQUIRED`: 該当項目を順に確認
+5. `REJECTED`: 再撮影案内
+
+クイックリプライで扱う操作:
+
+- `ok`（確定）
+- `edit`（修正開始）
+- `field:<field_name>`（修正対象選択）
+- `pick:<index>`（候補選択）
+- `free_text`（自由入力）
+- `hold`（保留）
+- `cancel`（キャンセル）
+- `back`（1段戻る）
 
 ---
 
-## 7. ルールエンジン仕様（MVP）
+## 8. LINE メッセージ仕様（MVP）
 
-## 7.1 判定ルール（初期案）
+### 画像受信直後
 
-### `AUTO_ACCEPT`
+- 返信: `画像を受け付けました。読み取り中です。`
+- 処理完了後:
+  - `AUTO_ACCEPT`: `登録しました: 医療機関 / 日付 / 金額 / 対象者`
+  - `REVIEW_REQUIRED`: `確認が必要です: 金額候補を選択してください`
+  - `REJECTED`: `読み取りに失敗しました。明るい場所で再撮影してください`
 
-以下を満たす場合
+### テキストコマンド
 
-* 金額あり（候補1位）かつ confidence >= 0.9
-* 日付あり confidence >= 0.8
-* 医療機関名あり confidence >= 0.75
-* 重大な矛盾なし（例：金額が0円、未来日付）
+- `今年の医療費`
+- `今月の医療費`
+- `未確認`
+- `ヘルプ`
 
-### `REVIEW_REQUIRED`
-
-* 必須項目のいずれか confidence不足
-* 金額候補が複数で近い（例: 4380 / 43800）
-* 医療機関名候補に揺れがある
-* 日付が曖昧（和暦/西暦変換不安定など）
-
-### `REJECTED`
-
-* 金額 or 日付が抽出不能
-* OCRテキスト量が少なすぎる
-* 画像品質が悪い（OCR文字数閾値未満など）
-
-## 7.2 候補生成
-
-### 金額候補
-
-* `円` 周辺の数値を優先
-* `合計`, `領収`, `今回` 近傍を優先
-* 桁異常候補も保持（レビュー用）
-
-### 日付候補
-
-* `YYYY/MM/DD`, `YY.MM.DD`, `R6.2.25` 等を正規化
-* 未来日付を除外（or 低優先）
-
-### 医療機関名候補
-
-* 上部の大きめ文字列（OCR依存）
-* `医院`, `病院`, `クリニック`, `薬局`, `歯科` を含む文字列を優先
-* 過去の確定済み医療機関名を優先候補に混ぜる（ユーザー辞書）
+`inbox/aggregate_service.py` で集計して返信。
 
 ---
 
-## 8. LINE会話フロー仕様（MVP）
+## 9. 既存実装の流用方針
 
-## 8.1 ユーザー意図（ルールベース）
+流用する:
 
-判定対象（完全一致 or 正規表現）:
+- `ReceiptExtractionPipeline.process(...)`
+- `ocr/documentai_adapter.py`
+- `core/enums.py`, `core/models.py`
+- `resolver/`, `extractors/`, `templates/`
 
-* `OK` / `登録` / `はい`
-* `修正する`
-* `保留`
-* `キャンセル`
-* `金額`
-* `日付`
-* `医療機関名`
-* `名前`
-* 候補値（ボタンのpayloadを優先）
-* 自由入力（フォールバック）
+新規実装する:
 
-> 注意: MVPでは **ボタンpayload** を最優先に使い、自然言語解析を最小限にすること。
+- LINE Webhook 受信・署名検証
+- LINE 画像取得 API 呼び出し
+- 会話ステート管理
+- SQLite 永続化
+- LINE Reply API / Push API クライアント
 
-## 8.2 クイックリプライ設計
+変更しない:
 
-### 共通
-
-* `OK`
-* `修正する`
-* `保留`
-* `キャンセル`
-
-### 修正項目選択
-
-* `医療機関名`
-* `金額`
-* `日付`
-* `名前`
-
-### 候補選択
-
-* 候補1
-* 候補2
-* 候補3（最大）
-* `手入力`（MVP簡易）
-* `戻る`
-
-## 8.3 返信テンプレート（例）
-
-* `AUTO_ACCEPT`: 登録完了＋修正導線
-* `REVIEW_REQUIRED`: 怪しい項目を明示して確認依頼
-* `REJECTED`: 再撮影ガイド
-* 修正完了: `金額を 4,380円 に修正しました`
-* 最終確認: `この内容で確定しますか？`
-* 完了: `登録しました（仮登録/確定）`
+- 既存 CLI (`extract`, `batch`, `compare-ocr`, `learn-template`, `healthcheck-ocr`)
+- 既存通知機能 (`notifications/`) の仕様
 
 ---
 
-## 9. コマンド仕様（LINEテキスト）
+## 10. セキュリティ / 運用要件（MVP必須）
 
-MVPで最低限サポート
-
-* `今年の医療費`
-
-  * 年間合計と件数を返す
-* `今月の医療費`
-
-  * 月間合計と件数
-* `未確認`
-
-  * `REVIEW_REQUIRED` / `HOLD` 件数
-* `ヘルプ`
-
-  * 使い方
-
-将来
-
-* `一覧`
-* `家族別`
-* `修正 #ID`
-* `CSV出力`
-
----
-
-## 10. セキュリティ・運用要件（MVP必須）
-
-## 10.1 秘密情報管理
-
-* APIキー/チャネルシークレットは **repoに置かない**
-* `.env.example` のみコミット
-* 本番は Secrets Manager（または同等）
-* `config.py` で必須値検証（不足時は起動失敗）
-
-## 10.2 Secret誤コミット対策（必須）
-
-* `pre-commit` 導入
-
-  * `gitleaks` or `detect-secrets`
-* CIでも secret scan 実行
-* `.gitignore` に以下含める
-
-  * `.env`
-  * `*.pem`
-  * `*.key`
-  * `secrets.*`
-
-## 10.3 ログ設計
-
-* OCR全文・画像URL・個人情報を `INFO` ログに出さない
-* 例外ログも request body 全出し禁止
-* マスキング対象
-
-  * 医療機関名（部分マスク可）
-  * 金額
-  * 日付
-  * LINE userId
-* 監査用イベントログは別（最小限）
-
-## 10.4 データ保持
-
-* 画像は短期保存（TTL削除）
-
-  * MVP目安: 7〜30日
-* 構造化データは保持
-* `raw_ocr_text` は短期保存 or 無効化可能設計
-
-## 10.5 権限
-
-* DB/Storageアクセス権は最小権限
-* 開発環境と本番環境の分離
+- `channel_secret`, `channel_access_token`, GCP 認証情報をリポジトリに置かない
+- Webhook 署名検証は必須（失敗時 401）
+- `line_user_id`, 金額, 日付, 氏名はログでマスク
+- 画像は TTL で削除（`image_retention_days`）
+- `processed_line_events` で webhook 冪等処理
 
 ---
 
 ## 11. 実装マイルストーン
 
-## Milestone 1: 基盤（ローカルで動く）
+### Milestone 1: 受信基盤
 
-### 目標
+- `app/line_webhook.py` と署名検証
+- 画像イベントを受け、メッセージIDから画像を保存
+- webhook 冪等化
 
-画像受信イベントをモックで通し、OCRモック結果から会話返信できる。
+完了条件:
 
-### タスク
+- LINE 画像送信でサーバーが 200 を返し、画像保存まで成功
 
-* [ ] FastAPI webhook 雛形
-* [ ] LINE署名検証
-* [ ] `core/models.py` 作成
-* [ ] `ocr/base.py`, `ocr/mock_adapter.py`
-* [ ] `extract/receipt_extractor.py`（モックOCR文字列対応）
-* [ ] `extract/rule_engine.py`
-* [ ] `linebot/message_templates.py`
-* [ ] `conversation/state_machine.py`
-* [ ] SQLiteスキーマ作成
-* [ ] ローカルE2E（モック）
+### Milestone 2: OCR 連携と登録
 
-### 完了条件
+- 保存画像を `ReceiptExtractionPipeline` へ接続（`documentai` 固定）
+- 抽出結果を DB 保存
+- `AUTO_ACCEPT / REVIEW_REQUIRED / REJECTED` に応じて返信
 
-* モック画像イベント → `AUTO_ACCEPT/REVIEW_REQUIRED/REJECTED` の返信が出る
+完了条件:
 
----
+- 実画像で 3 判定すべて返信確認
 
-## Milestone 2: ルールベース確認フロー
+### Milestone 3: 会話修正フロー
 
-### 目標
+- `state_machine.py`, `conversation_service.py` 実装
+- 候補選択、自由入力、保留、確定
+- `aggregate_entries` 更新
 
-LINE内のクイックリプライだけで修正・確定まで完結。
+完了条件:
 
-### タスク
+- `REVIEW_REQUIRED` ケースが LINE 内で確定まで完走
 
-* [ ] クイックリプライ payload設計
-* [ ] `conversation/handlers.py` 実装
-* [ ] `intents.py`（ルールベース）
-* [ ] 修正項目選択フロー
-* [ ] 候補選択フロー（amount/date/provider/person）
-* [ ] 保留/キャンセル/戻る
-* [ ] セッション期限切れ処理
-* [ ] 会話フローの単体テスト
+### Milestone 4: 集計・運用
 
-### 完了条件
+- テキストコマンド集計
+- 画像 TTL 削除ジョブ
+- ログマスキング最終確認
 
-* `REVIEW_REQUIRED` のケースが LINE内で確定まで完走する
+完了条件:
+
+- `今年の医療費` / `今月の医療費` / `未確認` が正しく返る
 
 ---
 
-## Milestone 3: 実OCR統合（1つ）
+## 12. テスト計画
 
-### 目標
+単体テスト:
 
-OCRアダプタを1つ実装して実画像で検証可能にする。
+- 署名検証
+- postback payload 解析
+- 状態遷移
+- repository CRUD
+- 会話ハンドラ
+- 集計計算
 
-### タスク
+結合テスト:
 
-* [ ] 実OCR adapter 実装（任意の1サービス）
-* [ ] 画像保存（S3またはローカル代替）
-* [ ] `ocr/normalizer.py` 強化（全角/半角、円、和暦）
-* [ ] 候補生成ロジック改善
-* [ ] 失敗時の `REJECTED` ガイド整備
-* [ ] 10〜30枚で精度検証（家族データ）
+- 画像イベント -> OCR -> 判定 -> 返信まで
+- `REVIEW_REQUIRED` の修正完了フロー
+- 冪等処理（同イベント再送）
 
-### 完了条件
+回帰テスト:
 
-* 家族データで主要ケースが動作
-* 誤認識時も会話修正で回復できる
-
----
-
-## Milestone 4: 集計機能と運用基盤
-
-### 目標
-
-実利用できる最低限の集計・セキュリティ運用を整える。
-
-### タスク
-
-* [ ] `今年の医療費` / `今月の医療費` コマンド
-* [ ] 仮登録/確定フラグ
-* [ ] Secret scan（pre-commit + CI）
-* [ ] ログマスキング
-* [ ] 画像TTL削除ジョブ（簡易で可）
-* [ ] 削除API/スクリプト（最低限）
-
-### 完了条件
-
-* 家族向けクローズド運用開始可能
-
----
-
-## 12. テスト方針
-
-## 12.1 単体テスト（必須）
-
-* `normalizer`
-* `rule_engine`
-* `candidate_builder`
-* `intents`
-* `state_machine`
-
-## 12.2 会話E2Eテスト（必須）
-
-最低限以下のシナリオを自動化
-
-1. `AUTO_ACCEPT` → 完了
-2. `REVIEW_REQUIRED` → `OK` で完了
-3. `REVIEW_REQUIRED` → `修正する` → `金額` → 候補選択 → 完了
-4. `REJECTED` → 再撮影案内
-5. `保留` → `未確認`コマンドで確認できる
-
-## 12.3 実データ評価（手動で可）
-
-* 家族協力の領収書をカテゴリ別に収集
-
-  * 病院 / 薬局 / 歯科
-* 評価項目
-
-  * 金額抽出成功率
-  * 日付抽出成功率
-  * 医療機関名抽出成功率
-  * 修正所要時間（1件あたり）
+- 既存 `tests/test_*.py` を維持し、CLI 機能が壊れていないことを確認
 
 ---
 
 ## 13. 受け入れ基準（MVP Done）
 
-### 機能
-
-* [ ] LINE画像送信で処理開始できる
-* [ ] `AUTO_ACCEPT/REVIEW_REQUIRED/REJECTED` が動く
-* [ ] `REVIEW_REQUIRED` をLINE内会話で修正・確定できる
-* [ ] 年間集計コマンドが返る
-
-### UX
-
-* [ ] 修正フローが「1ターン1判断」になっている
-* [ ] ボタン中心で完結する（自由入力は例外）
-* [ ] 保留できる
-
-### 安全性
-
-* [ ] Secret誤コミット対策が有効
-* [ ] ログに個人情報を出さない
-* [ ] 画像TTL削除の仕組みがある
+- LINE 画像送信から登録まで一連で動く
+- `AUTO_ACCEPT / REVIEW_REQUIRED / REJECTED` が会話で扱える
+- 修正・保留・確定が DB に反映される
+- `今年の医療費` と `今月の医療費` が返る
+- 秘密情報をコード/ログに露出しない
 
 ---
 
-## 14. 将来拡張（MVP後）
+## 14. 不明点ゼロ化チェック
 
-* 軽量LLMで自然言語修正の意図分類/スロット抽出
-* Web確認UI（詰みケースの救済）
-* 医療機関名辞書学習の強化
-* 複数領収書の一括確認
-* CSV/年次エクスポート
-* 家族アカウントの管理強化
-* OCR二段構え（軽量→高精度）
+### 14.1 この計画で確定した事項
 
----
+- OCR は `documentai` を第一優先で採用する
+- 抽出ロジックは既存 pipeline を流用する
+- 既存 CLI は残し、LINE は別入口として追加する
+- データ保存は MVP では SQLite を採用する
 
-## 15. Codexへの実装指示（重要）
+### 14.2 実装前に最終確認が必要な事項
 
-1. **まずはルールベースを優先**し、自然言語理解の高度化は行わないこと。
-2. **会話状態管理（state machine）を先に固定**すること。
-3. OCRは `ocr/base.py` のインターフェースに従い、最初は `mock_adapter.py` で動作確認すること。
-4. 返信文面は `message_templates.py` に集約し、ハードコードを分散させないこと。
-5. 秘密情報はコード・repoに埋め込まないこと。`.env.example` のみコミット可。
-6. ログはマスキング前提で実装すること（デバッグで個人情報を出さない）。
-7. 小さく動くE2E（モック）を最初に通してからOCR統合に進むこと。
+1. 実行基盤は `FastAPI + Uvicorn` で確定してよいか  
+2. 画像保存先はローカル (`data/inbox/images`) で開始してよいか  
+3. LINE 利用範囲は 1:1 チャット限定でよいか（グループ対応は後回し）  
+4. `AUTO_ACCEPT` は「自動確定」運用でよいか（毎回確認はしない）  
+5. `family_registry.required` は現行どおり `true` 維持でよいか  
+6. 画像保持期間は 14 日でよいか  
+7. 集計コマンドは `今年の医療費` / `今月の医療費` / `未確認` / `ヘルプ` で確定してよいか  
 
----
-
-## 16. 最初に作るファイル（優先順）
-
-* [ ] `core/enums.py`
-* [ ] `core/models.py`
-* [ ] `ocr/base.py`
-* [ ] `ocr/mock_adapter.py`
-* [ ] `ocr/normalizer.py`
-* [ ] `extract/receipt_extractor.py`
-* [ ] `extract/rule_engine.py`
-* [ ] `linebot/message_templates.py`
-* [ ] `linebot/quick_replies.py`
-* [ ] `conversation/state_machine.py`
-* [ ] `conversation/intents.py`
-* [ ] `conversation/handlers.py`
-* [ ] `domain/receipt_service.py`
-* [ ] `infra/db/schema.sql`
-* [ ] `app/main.py`
+この 7 項目が確定したら「不明点ゼロ」とし、実装フェーズに進む。

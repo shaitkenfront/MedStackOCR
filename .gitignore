@@ -26,6 +26,12 @@ data/templates/**
 data/outputs/**
 !data/outputs/
 !data/outputs/review_fix.example.json
+data/inbox/images/**
+!data/inbox/
+!data/inbox/images/
+!data/inbox/images/.gitkeep
+*.db
+*.sqlite3
 
 # Large local resources
 data/tessdata/*.traineddata

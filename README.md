@@ -145,6 +145,48 @@ python -m evaluation.eval_runner \
   --output data/outputs/metrics.json
 ```
 
+## LINE会話型インボックス（MVP）
+既存の抽出パイプラインをそのまま使い、LINE Webhook 経由で会話修正できます。
+
+主な追加モジュール:
+- `app/line_webhook.py`
+- `linebot/`
+- `inbox/`
+
+`config.yaml` 例:
+```yaml
+line_messaging:
+  enabled: true
+  channel_secret: "YOUR_LINE_CHANNEL_SECRET"
+  channel_access_token: "YOUR_LINE_CHANNEL_ACCESS_TOKEN"
+  webhook_path: "/webhook/line"
+  api_base_url: "https://api.line.me"
+  data_api_base_url: "https://api-data.line.me"
+  timeout_sec: 10
+  allowed_user_ids: []
+  default_household_id:
+  force_cpu: false
+
+inbox:
+  sqlite_path: "data/inbox/linebot.db"
+  image_store_dir: "data/inbox/images"
+  image_retention_days: 14
+  session_ttl_minutes: 60
+  max_candidate_options: 3
+  enable_text_commands: true
+```
+
+実行:
+```bash
+uvicorn app.line_webhook:app --host 0.0.0.0 --port 8000
+```
+
+LINEで使えるテキストコマンド:
+- `今年の医療費`
+- `今月の医療費`
+- `未確認`
+- `ヘルプ`
+
 ## テスト
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
@@ -194,3 +236,10 @@ D:\\ProgramData\\Anaconda\\python.exe -m venv .venv-py312-paddle
   --ocr-engine paddle \
   --output data/outputs/clinic_paddle_py312.json
 ```
+
+## 起動メモ
+
+ngrok使用の場合
+
+- `ngrok http 8000`
+- `uvicorn app.line_webhook:app --host 0.0.0.0 --port 8000`

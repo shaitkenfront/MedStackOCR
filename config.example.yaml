@@ -113,6 +113,26 @@ notifications:
     channel_access_token:
     to:
 
+line_messaging:
+  enabled: false
+  channel_secret:
+  channel_access_token:
+  webhook_path: /webhook/line
+  api_base_url: https://api.line.me
+  data_api_base_url: https://api-data.line.me
+  timeout_sec: 10
+  allowed_user_ids: []
+  default_household_id:
+  force_cpu: false
+
+inbox:
+  sqlite_path: data/inbox/linebot.db
+  image_store_dir: data/inbox/images
+  image_retention_days: 14
+  session_ttl_minutes: 60
+  max_candidate_options: 3
+  enable_text_commands: true
+
 output:
   save_audit: true
   pretty_json: true

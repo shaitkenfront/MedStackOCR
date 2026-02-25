@@ -1,6 +1,8 @@
 # Base dependencies
 PyYAML==6.0.2
 chardet==5.2.0
+fastapi==0.116.1
+uvicorn==0.35.0
 
 # OCR engine dependencies
 opencv-python
