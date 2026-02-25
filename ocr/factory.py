@@ -4,6 +4,7 @@ from typing import Any
 
 from ocr.base import OCRAdapter, OCRAdapterError
 from ocr.deepseek_adapter import DeepSeekOCRAdapter
+from ocr.documentai_adapter import GoogleDocumentAIAdapter
 from ocr.mock_adapter import MockOCRAdapter
 from ocr.paddle_adapter import PaddleOCRAdapter
 from ocr.tesseract_adapter import TesseractAdapter
@@ -14,6 +15,8 @@ def _canonical_engine_name(name: str) -> str:
     lowered = name.strip().lower()
     if lowered in {"deepseek-ocr", "deepseek_ocr"}:
         return "deepseek"
+    if lowered in {"document_ai", "google-documentai", "google_documentai"}:
+        return "documentai"
     return lowered
 
 
@@ -77,6 +80,21 @@ def create_ocr_adapter(engine_name: str, config: dict[str, Any]) -> OCRAdapter:
         device = yconf.get("device", "cuda")
         visualize = bool(yconf.get("visualize", False))
         return YomitokuOCRAdapter(device=device, visualize=visualize)
+
+    if name == "documentai":
+        _assert_engine_available(name, ocr_config)
+        doc_conf = ocr_config.get("documentai", {})
+        return GoogleDocumentAIAdapter(
+            project_id=doc_conf.get("project_id"),
+            location=doc_conf.get("location", "us"),
+            processor_id=doc_conf.get("processor_id"),
+            processor_version=doc_conf.get("processor_version"),
+            endpoint=doc_conf.get("endpoint"),
+            credentials_path=doc_conf.get("credentials_path"),
+            timeout_sec=int(doc_conf.get("timeout_sec", 120)),
+            mime_type=doc_conf.get("mime_type"),
+            field_mask=doc_conf.get("field_mask"),
+        )
 
     if name == "deepseek":
         _assert_engine_available(name, ocr_config)

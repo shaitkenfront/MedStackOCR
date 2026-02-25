@@ -3,6 +3,7 @@
 # paddleocr==3.4.0
 # paddlepaddle==3.3.0
 yomitoku==0.11.0
+google-cloud-documentai>=2.30.0
 # deepseek-ocr==0.3.0
 
 # For Yomitoku GPU (example):

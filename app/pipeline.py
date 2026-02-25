@@ -63,7 +63,9 @@ class ReceiptExtractionPipeline:
         }
         self._merge_candidate_pool(candidate_pool, self.facility_extractor.extract(document_type, lines))
         candidate_pool[FieldName.PAYMENT_DATE].extend(self.date_extractor.extract(lines))
-        candidate_pool[FieldName.PAYMENT_AMOUNT].extend(self.amount_extractor.extract(lines))
+        candidate_pool[FieldName.PAYMENT_AMOUNT].extend(
+            self.amount_extractor.extract(lines, ocr_engine=raw.engine)
+        )
         candidate_pool[FieldName.FAMILY_MEMBER_NAME].extend(self.family_name_extractor.extract(lines))
 
         if matched_template is not None:

@@ -13,6 +13,7 @@ ocr:
   engine: yomitoku
   allowed_engines:
     - yomitoku
+    # - documentai
   engines:
     mock:
       enabled: false
@@ -52,6 +53,15 @@ ocr:
       enabled: false
     documentai:
       enabled: false
+      project_id:
+      location: us
+      processor_id:
+      processor_version:
+      endpoint:
+      credentials_path:
+      timeout_sec: 120
+      mime_type:
+      field_mask:
 
 templates:
   store_path: data/templates

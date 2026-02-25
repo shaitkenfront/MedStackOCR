@@ -97,6 +97,30 @@ python -m app.main compare-ocr \
   --target-dir data/outputs/compare
 ```
 
+`yomitoku` と `documentai` を比較する場合は、事前に `config.yaml` の許可エンジンと `documentai` 設定を追加します。
+
+```yaml
+ocr:
+  allowed_engines:
+    - yomitoku
+    - documentai
+  engines:
+    documentai:
+      enabled: true
+      project_id: your-gcp-project-id
+      location: us
+      processor_id: your-processor-id
+      credentials_path: C:\\path\\to\\service-account.json
+```
+
+```bash
+python -m app.main compare-ocr \
+  --config config.yaml \
+  --image data/samples/pharmacy_receipt.jpg \
+  --ocr-engines yomitoku,documentai \
+  --target-dir data/outputs/compare
+```
+
 ```bash
 python -m app.main healthcheck-ocr \
   --config config.yaml \
@@ -130,6 +154,7 @@ python -m unittest discover -s tests -p "test_*.py"
 - `deepseek`: `backend: api|local` を選択可能。
   - `api`: `DS_OCR_API_KEY` が必要（`deepseek-ocr` パッケージ経由）。
   - `local`: `torch` + `transformers` が必要（`deepseek-ai/DeepSeek-OCR` をローカル推論）。
+- `documentai`: `google-cloud-documentai` が必要。`project_id` / `processor_id` / 認証情報（`GOOGLE_APPLICATION_CREDENTIALS` または `credentials_path`）を設定。
 
 `config.yaml` 例（ローカル推論）:
 ```yaml
