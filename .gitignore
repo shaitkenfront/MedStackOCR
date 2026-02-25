@@ -15,6 +15,13 @@ env/
 # Local cloned third-party repositories
 external/
 
+# Local private config and learned templates
+config.yaml
+!config.example.yaml
+data/templates/**
+!data/templates/
+!data/templates/.gitkeep
+
 # Generated outputs (keep only example for review flow)
 data/outputs/**
 !data/outputs/
@@ -23,6 +30,7 @@ data/outputs/**
 # Large local resources
 data/tessdata/*.traineddata
 data/samples/
+scripts/
 
 # OS generated files
 .DS_Store

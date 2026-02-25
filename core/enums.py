@@ -20,10 +20,11 @@ class FieldName:
     PRESCRIBING_FACILITY_NAME = "prescribing_facility_name"
     PAYMENT_DATE = "payment_date"
     PAYMENT_AMOUNT = "payment_amount"
+    FAMILY_MEMBER_NAME = "family_member_name"
 
     REQUIRED_FIELDS = (
         PAYER_FACILITY_NAME,
         PAYMENT_DATE,
         PAYMENT_AMOUNT,
+        FAMILY_MEMBER_NAME,
     )
-

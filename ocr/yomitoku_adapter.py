@@ -5,6 +5,17 @@ from typing import Any
 from core.models import OCRRawResult
 from ocr.base import OCRAdapterError
 
+CUDA_UNAVAILABLE_HINTS = (
+    "cuda",
+    "gpu",
+    "nvidia",
+    "not available",
+    "is unavailable",
+    "not compiled",
+    "no kernel image",
+    "driver",
+)
+
 
 def _points_to_bbox(points: list[list[float]] | list[tuple[float, float]]) -> list[float]:
     xs = [float(p[0]) for p in points]
@@ -20,6 +31,7 @@ class YomitokuOCRAdapter:
         self.device = device
         self.visualize = visualize
         self._cv2: Any = None
+        self._np: Any = None
         self._ocr: Any = None
         self._ocr_cls: Any = None
         self._load_dependency()
@@ -27,6 +39,7 @@ class YomitokuOCRAdapter:
     def _load_dependency(self) -> None:
         try:
             import cv2  # type: ignore
+            import numpy as np  # type: ignore
             import yomitoku  # type: ignore
             from yomitoku import OCR  # type: ignore
         except Exception as exc:
@@ -36,15 +49,29 @@ class YomitokuOCRAdapter:
             ) from exc
 
         self._cv2 = cv2
+        self._np = np
         self._ocr_cls = OCR
         self.version = str(getattr(yomitoku, "__version__", "unknown"))
 
     def _ensure_ocr(self) -> None:
         if self._ocr is not None:
             return
+        requested_device = str(self.device or "cuda").strip().lower()
+        if requested_device.startswith("cuda") and not self._is_cuda_available():
+            self.device = "cpu"
         try:
             self._ocr = self._ocr_cls(device=self.device, visualize=self.visualize)
         except Exception as exc:
+            if requested_device.startswith("cuda") and self._should_fallback_to_cpu(exc):
+                try:
+                    self.device = "cpu"
+                    self._ocr = self._ocr_cls(device=self.device, visualize=self.visualize)
+                    return
+                except Exception as cpu_exc:
+                    raise OCRAdapterError(
+                        "failed to initialize yomitoku OCR on both CUDA and CPU: "
+                        f"cuda_error={exc} cpu_error={cpu_exc}"
+                    ) from cpu_exc
             raise OCRAdapterError(f"failed to initialize yomitoku OCR: {exc}") from exc
 
     def healthcheck(self) -> bool:
@@ -52,7 +79,7 @@ class YomitokuOCRAdapter:
 
     def run(self, image_path: str) -> OCRRawResult:
         self._ensure_ocr()
-        image = self._cv2.imread(image_path)
+        image = self._load_image(image_path)
         if image is None:
             raise OCRAdapterError(f"failed to load image for yomitoku: {image_path}")
 
@@ -68,6 +95,22 @@ class YomitokuOCRAdapter:
             payload=lines,
             metadata={"device": self.device},
         )
+
+    def _load_image(self, image_path: str) -> Any:
+        # cv2.imread can fail on Windows non-ASCII paths depending on build.
+        image = self._cv2.imread(image_path)
+        if image is not None:
+            return image
+        try:
+            raw = self._np.fromfile(image_path, dtype=self._np.uint8)
+        except Exception:
+            return None
+        if raw is None or getattr(raw, "size", 0) == 0:
+            return None
+        try:
+            return self._cv2.imdecode(raw, self._cv2.IMREAD_COLOR)
+        except Exception:
+            return None
 
     def _convert(self, raw: Any) -> list[dict[str, Any]]:
         schema = raw
@@ -131,3 +174,19 @@ class YomitokuOCRAdapter:
             return float(value)
         except Exception:
             return default
+
+    @staticmethod
+    def _is_cuda_available() -> bool:
+        try:
+            import torch  # type: ignore
+        except Exception:
+            return False
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _should_fallback_to_cpu(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(hint in message for hint in CUDA_UNAVAILABLE_HINTS)
