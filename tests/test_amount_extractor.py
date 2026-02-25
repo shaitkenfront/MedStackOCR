@@ -394,6 +394,47 @@ class AmountExtractorTest(unittest.TestCase):
         self.assertTrue(candidates)
         self.assertEqual(candidates[0].value_normalized, 640)
 
+    def test_documentai_tuning_can_disable_alignment_bonus(self) -> None:
+        extractor = AmountExtractor(documentai_tuning={"label_alignment_bonus_max": 0.0})
+        lines = [
+            OCRLine(
+                text="自己負担額",
+                bbox=(0.52, 0.38, 0.57, 0.39),
+                polygon=None,
+                confidence=0.95,
+                line_index=0,
+                page=1,
+            ),
+            OCRLine(
+                text="5,740",
+                bbox=(0.45, 0.42, 0.49, 0.43),
+                polygon=None,
+                confidence=0.95,
+                line_index=1,
+                page=1,
+            ),
+            OCRLine(
+                text="1,720",
+                bbox=(0.56, 0.42, 0.59, 0.43),
+                polygon=None,
+                confidence=0.95,
+                line_index=2,
+                page=1,
+            ),
+            OCRLine(
+                text="円",
+                bbox=(0.60, 0.41, 0.61, 0.43),
+                polygon=None,
+                confidence=0.95,
+                line_index=3,
+                page=1,
+            ),
+        ]
+
+        candidates = extractor.extract(lines, ocr_engine="documentai")
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0].value_normalized, 5740)
+
 
 if __name__ == "__main__":
     unittest.main()

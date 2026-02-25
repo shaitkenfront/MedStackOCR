@@ -111,6 +111,9 @@ ocr:
       location: us
       processor_id: your-processor-id
       credentials_path: C:\\path\\to\\service-account.json
+      amount_tuning:
+        label_alignment_bonus_max: 3.0
+        near_secondary_without_currency_penalty: 1.8
 ```
 
 ```bash
@@ -155,6 +158,7 @@ python -m unittest discover -s tests -p "test_*.py"
   - `api`: `DS_OCR_API_KEY` が必要（`deepseek-ocr` パッケージ経由）。
   - `local`: `torch` + `transformers` が必要（`deepseek-ai/DeepSeek-OCR` をローカル推論）。
 - `documentai`: `google-cloud-documentai` が必要。`project_id` / `processor_id` / 認証情報（`GOOGLE_APPLICATION_CREDENTIALS` または `credentials_path`）を設定。
+  - 金額抽出の専用調整は `ocr.engines.documentai.amount_tuning` で変更可能。
 
 `config.yaml` 例（ローカル推論）:
 ```yaml

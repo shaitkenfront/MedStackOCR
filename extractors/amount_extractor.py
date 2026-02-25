@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from core.enums import FieldName
 from core.models import Candidate, OCRLine
@@ -31,12 +32,31 @@ DOCUMENTAI_ADDRESS_KEYWORDS = ("都", "道", "府", "県", "市", "区", "町", 
 DOCUMENTAI_MEDICATION_KEYWORDS = ("後発医薬品", "日分", "錠", "mg", "mL", "mℓ", "包")
 DOCUMENTAI_STRONG_AMOUNT_LABELS = ("請求金額", "領収金額", "自己負担額", "一部負担金", "今回請求額", "今回お支払額")
 DOCUMENTAI_NOTE_KEYWORDS = ("未満", "四捨五入", "再発行", "印紙法")
+DEFAULT_DOCUMENTAI_TUNING: dict[str, float | int] = {
+    "exclude_context_currency_primary_penalty": 1.0,
+    "currency_primary_bonus": 1.2,
+    "near_secondary_without_currency_penalty": 1.8,
+    "address_context_penalty": 2.2,
+    "medication_context_penalty": 1.8,
+    "long_text_number_penalty": 2.2,
+    "long_text_min_length": 28,
+    "long_text_min_digits": 3,
+    "small_plain_number_penalty": 2.4,
+    "label_alignment_bonus_max": 3.0,
+    "label_alignment_max_dx": 0.25,
+    "label_alignment_max_dy": 0.08,
+    "label_anchor_max_length": 16,
+    "label_anchor_max_digits": 2,
+}
 
 RE_AMOUNT = re.compile(r"(?:[¥￥]\s*)?(?P<value>\d{1,3}(?:,\d{3})+|\d+)\s*(?:円)?")
 RE_IDENTIFIER_NO = re.compile(r"\b(?:NO|No)\.?\s*\d", re.IGNORECASE)
 
 
 class AmountExtractor:
+    def __init__(self, documentai_tuning: dict[str, Any] | None = None) -> None:
+        self.documentai_tuning = self._resolve_documentai_tuning(documentai_tuning)
+
     def extract(self, lines: list[OCRLine], ocr_engine: str | None = None) -> list[Candidate]:
         candidates: list[Candidate] = []
         is_documentai = self._is_documentai_engine(ocr_engine)
@@ -113,7 +133,7 @@ class AmountExtractor:
                 if has_exclude_context or near_exclude_context:
                     penalty = 3.0
                     if is_documentai and has_currency and (has_primary_label or near_primary_label):
-                        penalty = 1.0
+                        penalty = self.documentai_tuning["exclude_context_currency_primary_penalty"]
                         reasons.append("documentai_reduce_excluded_points_tax_penalty")
                     score -= penalty
                     reasons.append("excluded_points_tax_context")
@@ -170,22 +190,26 @@ class AmountExtractor:
 
                 if is_documentai:
                     if has_currency and (has_primary_label or near_primary_label):
-                        score += 1.2
+                        score += self.documentai_tuning["currency_primary_bonus"]
                         reasons.append("documentai_currency_primary_bonus")
                     if near_secondary_label and not near_primary_label and not has_currency:
-                        score -= 1.8
+                        score -= self.documentai_tuning["near_secondary_without_currency_penalty"]
                         reasons.append("documentai_near_secondary_without_currency_penalty")
                     if has_address_context and not has_currency and not has_primary_label and not near_primary_label:
-                        score -= 2.2
+                        score -= self.documentai_tuning["address_context_penalty"]
                         reasons.append("documentai_address_context_penalty")
                     if has_medication_context and not has_currency and not has_primary_label:
-                        score -= 1.8
+                        score -= self.documentai_tuning["medication_context_penalty"]
                         reasons.append("documentai_medication_context_penalty")
-                    if len(text) >= 28 and text_digit_count >= 3 and not has_currency:
-                        score -= 2.2
+                    if (
+                        len(text) >= self.documentai_tuning["long_text_min_length"]
+                        and text_digit_count >= self.documentai_tuning["long_text_min_digits"]
+                        and not has_currency
+                    ):
+                        score -= self.documentai_tuning["long_text_number_penalty"]
                         reasons.append("documentai_long_text_number_penalty")
                     if value < 10 and not has_currency:
-                        score -= 2.4
+                        score -= self.documentai_tuning["small_plain_number_penalty"]
                         reasons.append("documentai_small_plain_number_penalty")
                     alignment_bonus = self._documentai_label_alignment_bonus(
                         line=line,
@@ -285,25 +309,31 @@ class AmountExtractor:
     def _has_documentai_note_context(text: str) -> bool:
         return any(keyword in text for keyword in DOCUMENTAI_NOTE_KEYWORDS)
 
-    @staticmethod
-    def _collect_documentai_label_anchors(lines: list[OCRLine]) -> list[OCRLine]:
+    def _collect_documentai_label_anchors(self, lines: list[OCRLine]) -> list[OCRLine]:
         anchors: list[OCRLine] = []
+        max_length = self.documentai_tuning["label_anchor_max_length"]
+        max_digits = self.documentai_tuning["label_anchor_max_digits"]
         for line in lines:
             text = normalize_spaces(line.text)
             if not any(keyword in text for keyword in DOCUMENTAI_ALIGNMENT_LABELS):
                 continue
-            if len(text) > 16 and text not in DOCUMENTAI_ALIGNMENT_LABELS:
+            if len(text) > max_length and text not in DOCUMENTAI_ALIGNMENT_LABELS:
                 continue
             if AmountExtractor._has_documentai_note_context(text):
                 continue
-            if count_digits(text) >= 3:
+            if count_digits(text) > max_digits:
                 continue
             anchors.append(line)
         return anchors
 
-    @staticmethod
-    def _documentai_label_alignment_bonus(line: OCRLine, label_anchors: list[OCRLine]) -> float:
+    def _documentai_label_alignment_bonus(self, line: OCRLine, label_anchors: list[OCRLine]) -> float:
         if not label_anchors:
+            return 0.0
+
+        max_bonus = self.documentai_tuning["label_alignment_bonus_max"]
+        max_dx = self.documentai_tuning["label_alignment_max_dx"]
+        max_dy = self.documentai_tuning["label_alignment_max_dy"]
+        if max_bonus <= 0.0 or max_dx <= 0.0 or max_dy <= 0.0:
             return 0.0
 
         line_cx = (line.bbox[0] + line.bbox[2]) / 2.0
@@ -316,11 +346,104 @@ class AmountExtractor:
             anchor_cy = (anchor.bbox[1] + anchor.bbox[3]) / 2.0
             dx = abs(line_cx - anchor_cx)
             dy = abs(line_cy - anchor_cy)
-            if dx > 0.25 or dy > 0.08:
+            if dx > max_dx or dy > max_dy:
                 continue
-            x_factor = 1.0 - (dx / 0.25)
-            y_factor = 1.0 - (dy / 0.08)
-            bonus = 3.0 * x_factor * y_factor
+            x_factor = 1.0 - (dx / max_dx)
+            y_factor = 1.0 - (dy / max_dy)
+            bonus = max_bonus * x_factor * y_factor
             if bonus > best_bonus:
                 best_bonus = bonus
         return best_bonus
+
+    @staticmethod
+    def _resolve_documentai_tuning(overrides: dict[str, Any] | None) -> dict[str, float | int]:
+        source = overrides if isinstance(overrides, dict) else {}
+        defaults = DEFAULT_DOCUMENTAI_TUNING
+        return {
+            "exclude_context_currency_primary_penalty": AmountExtractor._safe_float(
+                source.get("exclude_context_currency_primary_penalty"),
+                float(defaults["exclude_context_currency_primary_penalty"]),
+                minimum=0.0,
+            ),
+            "currency_primary_bonus": AmountExtractor._safe_float(
+                source.get("currency_primary_bonus"),
+                float(defaults["currency_primary_bonus"]),
+                minimum=0.0,
+            ),
+            "near_secondary_without_currency_penalty": AmountExtractor._safe_float(
+                source.get("near_secondary_without_currency_penalty"),
+                float(defaults["near_secondary_without_currency_penalty"]),
+                minimum=0.0,
+            ),
+            "address_context_penalty": AmountExtractor._safe_float(
+                source.get("address_context_penalty"),
+                float(defaults["address_context_penalty"]),
+                minimum=0.0,
+            ),
+            "medication_context_penalty": AmountExtractor._safe_float(
+                source.get("medication_context_penalty"),
+                float(defaults["medication_context_penalty"]),
+                minimum=0.0,
+            ),
+            "long_text_number_penalty": AmountExtractor._safe_float(
+                source.get("long_text_number_penalty"),
+                float(defaults["long_text_number_penalty"]),
+                minimum=0.0,
+            ),
+            "long_text_min_length": AmountExtractor._safe_int(
+                source.get("long_text_min_length"),
+                int(defaults["long_text_min_length"]),
+                minimum=1,
+            ),
+            "long_text_min_digits": AmountExtractor._safe_int(
+                source.get("long_text_min_digits"),
+                int(defaults["long_text_min_digits"]),
+                minimum=0,
+            ),
+            "small_plain_number_penalty": AmountExtractor._safe_float(
+                source.get("small_plain_number_penalty"),
+                float(defaults["small_plain_number_penalty"]),
+                minimum=0.0,
+            ),
+            "label_alignment_bonus_max": AmountExtractor._safe_float(
+                source.get("label_alignment_bonus_max"),
+                float(defaults["label_alignment_bonus_max"]),
+                minimum=0.0,
+            ),
+            "label_alignment_max_dx": AmountExtractor._safe_float(
+                source.get("label_alignment_max_dx"),
+                float(defaults["label_alignment_max_dx"]),
+                minimum=0.0,
+            ),
+            "label_alignment_max_dy": AmountExtractor._safe_float(
+                source.get("label_alignment_max_dy"),
+                float(defaults["label_alignment_max_dy"]),
+                minimum=0.0,
+            ),
+            "label_anchor_max_length": AmountExtractor._safe_int(
+                source.get("label_anchor_max_length"),
+                int(defaults["label_anchor_max_length"]),
+                minimum=1,
+            ),
+            "label_anchor_max_digits": AmountExtractor._safe_int(
+                source.get("label_anchor_max_digits"),
+                int(defaults["label_anchor_max_digits"]),
+                minimum=0,
+            ),
+        }
+
+    @staticmethod
+    def _safe_float(value: Any, default: float, minimum: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, parsed)
+
+    @staticmethod
+    def _safe_int(value: Any, default: int, minimum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, parsed)
