@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -67,9 +66,8 @@ class LineWebhookHandler:
         self.image_store_dir = Path(str(self.inbox_conf.get("image_store_dir", "data/inbox/images")))
         self.image_store_dir.mkdir(parents=True, exist_ok=True)
         self.default_household_id = self.line_conf.get("default_household_id")
-        self.force_cpu = bool(self.line_conf.get("force_cpu", False))
         self._pipeline: ReceiptExtractionPipeline | None = None
-        self._runtime_config: dict[str, Any] = _apply_force_cpu_config(config, force_cpu=self.force_cpu)
+        self._runtime_config: dict[str, Any] = config
 
     def handle(self, body: bytes, signature: str | None) -> tuple[int, dict[str, Any]]:
         if not self.enabled:
@@ -220,15 +218,3 @@ def _event_id(event: dict[str, Any]) -> str:
 
 def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
-
-
-def _apply_force_cpu_config(config: dict[str, Any], force_cpu: bool) -> dict[str, Any]:
-    if not force_cpu:
-        return config
-
-    updated = deepcopy(config)
-    ocr_conf = updated.setdefault("ocr", {})
-    engines_conf = ocr_conf.setdefault("engines", {})
-    yomitoku_conf = engines_conf.setdefault("yomitoku", {})
-    yomitoku_conf["device"] = "cpu"
-    return updated

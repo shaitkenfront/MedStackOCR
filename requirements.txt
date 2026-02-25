@@ -5,5 +5,4 @@ fastapi==0.116.1
 uvicorn==0.35.0
 
 # OCR engine dependencies
-opencv-python
--r requirements-ocr-optional.txt
+google-cloud-documentai>=2.30.0

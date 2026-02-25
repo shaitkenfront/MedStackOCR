@@ -10,49 +10,14 @@ pipeline:
     weight_by_confidence: true
 
 ocr:
-  engine: yomitoku
+  engine: documentai
   allowed_engines:
-    - yomitoku
-    # - documentai
+    - documentai
   engines:
     mock:
       enabled: false
-    tesseract:
-      enabled: false
-      lang: jpn+eng
-      cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
-      tessdata_dir: "data/tessdata"
-    paddle:
-      enabled: false
-      lang: ja
-      use_gpu: true
-      ocr_version:
-    yomitoku:
-      enabled: true
-      device: cuda
-      visualize: false
-    deepseek:
-      enabled: false
-      backend: api
-      api_key_env: DS_OCR_API_KEY
-      api_key:
-      base_url:
-      model_name:
-      mode: free_ocr
-      dpi: 200
-      local_prompt:
-      local_output_dir:
-      local_base_size: 512
-      local_image_size: 512
-      local_crop_mode: false
-      local_device: cuda
-      local_dtype: bfloat16
-      local_attn_impl: eager
-      local_trust_remote_code: true
-    vision:
-      enabled: false
     documentai:
-      enabled: false
+      enabled: true
       project_id:
       location: us
       processor_id:
@@ -123,7 +88,6 @@ line_messaging:
   timeout_sec: 10
   allowed_user_ids: []
   default_household_id:
-  force_cpu: false
 
 inbox:
   sqlite_path: data/inbox/linebot.db

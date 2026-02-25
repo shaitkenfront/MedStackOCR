@@ -33,7 +33,7 @@ def _build_result(name: str, date_value: str, status: DecisionStatus = DecisionS
         template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
         fields=fields,
         decision=Decision(status=status, confidence=0.8, reasons=["all_required_fields_present"]),
-        audit=AuditInfo(engine="yomitoku", engine_version="test", pipeline_version="test"),
+        audit=AuditInfo(engine="documentai", engine_version="test", pipeline_version="test"),
     )
 
 

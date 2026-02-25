@@ -23,10 +23,11 @@
 - 未登録かつ異姓: `REJECTED`
 
 ## 5. 日次運用フロー
-1. バッチ実行: `python -m app.main batch --config config.yaml --input-dir data/samples --household-id household_demo --output-dir data/outputs/yomitoku_tuned`
-2. `REVIEW_REQUIRED` / `REJECTED` の `family_member_name` と `decision.reasons` を確認
-3. 正当な家族なら `aliases` を追加して再実行
-4. 他姓ノイズなら辞書追加せずそのまま `REJECTED` を維持
+1. Webhook起動: `uvicorn app.line_webhook:app --host 0.0.0.0 --port 8000`
+2. LINEで領収書画像を送信
+3. `REVIEW_REQUIRED` / `REJECTED` の `family_member_name` と `decision.reasons` を確認
+4. 正当な家族なら `aliases` を追加して再送信
+5. 他姓ノイズなら辞書追加せずそのまま `REJECTED` を維持
 
 ## 6. メンテナンスの目安
 - 1名につき最低3〜5個の `aliases` を持つ
