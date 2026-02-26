@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -314,13 +315,23 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         )
 
     def get_year_summary(self, line_user_id: str, year: int) -> tuple[int, int]:
-        prefix = f"{year:04d}-"
-        rows = self._query_aggregate_entries(line_user_id=line_user_id, prefix=prefix)
+        rows = self._query_aggregate_entries(line_user_id=line_user_id)
+        year_prefix = f"{year:04d}-"
+        rows = [
+            item
+            for item in rows
+            if str(_summary_date_from_values(item.get("service_date"), item.get("created_at")) or "").startswith(year_prefix)
+        ]
         return _summarize(rows, statuses={"tentative", "confirmed"})
 
     def get_month_summary(self, line_user_id: str, year: int, month: int) -> tuple[int, int]:
-        prefix = f"{year:04d}-{month:02d}"
-        rows = self._query_aggregate_entries(line_user_id=line_user_id, prefix=prefix)
+        rows = self._query_aggregate_entries(line_user_id=line_user_id)
+        month_prefix = f"{year:04d}-{month:02d}-"
+        rows = [
+            item
+            for item in rows
+            if str(_summary_date_from_values(item.get("service_date"), item.get("created_at")) or "").startswith(month_prefix)
+        ]
         return _summarize(rows, statuses={"tentative", "confirmed"})
 
     def get_pending_count(self, line_user_id: str) -> int:
@@ -588,27 +599,31 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
             return
         rule_key = _learning_rule_key(normalized_field, normalized_context, normalized_value)
         now = _utc_now()
-        self._learning_table.update_item(
-            Key={"line_user_id": user_id, "rule_key": rule_key},
-            UpdateExpression=(
-                "SET #field_name = :field_name, #context_key = :context_key, corrected_value = :corrected_value, "
-                "updated_at = :updated_at, created_at = if_not_exists(created_at, :created_at) "
-                "ADD #count :incr"
-            ),
-            ExpressionAttributeNames={
-                "#count": "count",
-                "#field_name": "field_name",
-                "#context_key": "context_key",
-            },
-            ExpressionAttributeValues={
-                ":field_name": normalized_field,
-                ":context_key": normalized_context,
-                ":corrected_value": normalized_value,
-                ":updated_at": now,
-                ":created_at": now,
-                ":incr": 1,
-            },
-        )
+        try:
+            self._increment_learning_rule_count(
+                line_user_id=user_id,
+                rule_key=rule_key,
+                field_name=normalized_field,
+                context_key=normalized_context,
+                corrected_value=normalized_value,
+                now=now,
+            )
+        except ClientError as exc:
+            if not _is_add_operand_type_error(exc):
+                raise
+            self._normalize_learning_rule_count(
+                line_user_id=user_id,
+                rule_key=rule_key,
+                updated_at=now,
+            )
+            self._increment_learning_rule_count(
+                line_user_id=user_id,
+                rule_key=rule_key,
+                field_name=normalized_field,
+                context_key=normalized_context,
+                corrected_value=normalized_value,
+                now=now,
+            )
 
     def get_field_correction_hint(
         self,
@@ -750,26 +765,22 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
                 {
                     "Update": {
                         "TableName": self._usage_guard_table.name,
-                        "Key": self._to_ddb_key(
-                            {
-                                "scope_key": bucket["scope_key"],
-                                "window_key": bucket["window_key"],
-                            }
-                        ),
+                        "Key": {
+                            "scope_key": bucket["scope_key"],
+                            "window_key": bucket["window_key"],
+                        },
                         "UpdateExpression": (
                             "ADD #count :incr "
                             "SET expires_at_epoch = if_not_exists(expires_at_epoch, :expires), updated_at = :updated_at"
                         ),
                         "ConditionExpression": "attribute_not_exists(#count) OR #count < :limit",
                         "ExpressionAttributeNames": {"#count": "count"},
-                        "ExpressionAttributeValues": self._to_ddb_key(
-                            {
-                                ":incr": 1,
-                                ":limit": int(bucket["limit"]),
-                                ":expires": int(bucket["expires_at_epoch"]),
-                                ":updated_at": now_text,
-                            }
-                        ),
+                        "ExpressionAttributeValues": {
+                            ":incr": 1,
+                            ":limit": int(bucket["limit"]),
+                            ":expires": int(bucket["expires_at_epoch"]),
+                            ":updated_at": now_text,
+                        },
                     }
                 }
             )
@@ -779,6 +790,16 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
             client.transact_write_items(TransactItems=transact_items)
             return True, None
         except ClientError as exc:
+            if _is_add_operand_type_error(exc):
+                self._normalize_ocr_guard_count_types(buckets=buckets, updated_at=now_text)
+                try:
+                    client.transact_write_items(TransactItems=transact_items)
+                    return True, None
+                except ClientError as retry_exc:
+                    code = str(retry_exc.response.get("Error", {}).get("Code", ""))
+                    if code != "TransactionCanceledException":
+                        raise
+                    return False, self._detect_ocr_quota_reject_reason(buckets)
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code != "TransactionCanceledException":
                 raise
@@ -939,6 +960,96 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
             kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
         return items
 
+    def _increment_learning_rule_count(
+        self,
+        *,
+        line_user_id: str,
+        rule_key: str,
+        field_name: str,
+        context_key: str,
+        corrected_value: Any,
+        now: str,
+    ) -> None:
+        self._learning_table.update_item(
+            Key={"line_user_id": line_user_id, "rule_key": rule_key},
+            UpdateExpression=(
+                "SET #field_name = :field_name, #context_key = :context_key, corrected_value = :corrected_value, "
+                "updated_at = :updated_at, created_at = if_not_exists(created_at, :created_at) "
+                "ADD #count :incr"
+            ),
+            ExpressionAttributeNames={
+                "#count": "count",
+                "#field_name": "field_name",
+                "#context_key": "context_key",
+            },
+            ExpressionAttributeValues={
+                ":field_name": field_name,
+                ":context_key": context_key,
+                ":corrected_value": corrected_value,
+                ":updated_at": now,
+                ":created_at": now,
+                ":incr": 1,
+            },
+        )
+
+    def _normalize_learning_rule_count(
+        self,
+        *,
+        line_user_id: str,
+        rule_key: str,
+        updated_at: str,
+    ) -> None:
+        item = self._learning_table.get_item(
+            Key={"line_user_id": line_user_id, "rule_key": rule_key},
+            ConsistentRead=True,
+        ).get("Item")
+        if not isinstance(item, dict):
+            return
+        raw_count = item.get("count")
+        if raw_count is None or _is_add_compatible_count(raw_count):
+            return
+        normalized_count = _coerce_add_count(raw_count)
+        self._learning_table.update_item(
+            Key={"line_user_id": line_user_id, "rule_key": rule_key},
+            UpdateExpression="SET #count = :count, updated_at = :updated_at",
+            ExpressionAttributeNames={"#count": "count"},
+            ExpressionAttributeValues={
+                ":count": normalized_count,
+                ":updated_at": updated_at,
+            },
+        )
+
+    def _normalize_ocr_guard_count_types(
+        self,
+        *,
+        buckets: list[dict[str, Any]],
+        updated_at: str,
+    ) -> None:
+        for bucket in buckets:
+            key = {
+                "scope_key": bucket["scope_key"],
+                "window_key": bucket["window_key"],
+            }
+            item = self._usage_guard_table.get_item(
+                Key=key,
+                ConsistentRead=True,
+            ).get("Item")
+            if not isinstance(item, dict):
+                continue
+            raw_count = item.get("count")
+            if raw_count is None or _is_add_compatible_count(raw_count):
+                continue
+            normalized_count = _coerce_add_count(raw_count)
+            self._usage_guard_table.update_item(
+                Key=key,
+                UpdateExpression="SET #count = :count, updated_at = :updated_at",
+                ExpressionAttributeNames={"#count": "count"},
+                ExpressionAttributeValues={
+                    ":count": normalized_count,
+                    ":updated_at": updated_at,
+                },
+            )
+
     def _detect_ocr_quota_reject_reason(self, buckets: list[dict[str, Any]]) -> str:
         for bucket in buckets:
             item = self._usage_guard_table.get_item(
@@ -999,6 +1110,52 @@ def _summarize(rows: list[dict[str, Any]], statuses: set[str]) -> tuple[int, int
         total += amount
         count += 1
     return total, count
+
+
+def _is_add_operand_type_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", {})
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error", {})
+    if not isinstance(error, dict):
+        return False
+    code = str(error.get("Code", ""))
+    if code != "ValidationException":
+        return False
+    message = str(error.get("Message", ""))
+    return "operator: ADD" in message and "ALLOWED_FOR_ADD_OPERAND" in message
+
+
+def _is_add_compatible_count(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float, Decimal))
+
+
+def _coerce_add_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, Decimal):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return int(Decimal(text))
+            except Exception:
+                return 0
+    if isinstance(value, dict):
+        for key in ("N", "n", "value", "count", "S", "s"):
+            if key not in value:
+                continue
+            return _coerce_add_count(value.get(key))
+    return 0
 
 
 def _as_decimal(value: float) -> Decimal:
@@ -1068,14 +1225,50 @@ def _to_date_text(value: Any) -> str | None:
     text = (str(value).strip() if value is not None else "")
     if not text:
         return None
-    if "/" in text:
-        parts = text.split("/")
-        if len(parts) == 3:
+    candidates = [text]
+    if len(text) >= 10:
+        candidates.append(text[:10])
+    for candidate in candidates:
+        full_match = _FULL_DATE_RE.match(candidate)
+        if full_match is not None:
             try:
-                return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+                parsed = datetime(
+                    year=int(full_match.group("year")),
+                    month=int(full_match.group("month")),
+                    day=int(full_match.group("day")),
+                )
             except Exception:
-                return text
+                continue
+            return parsed.strftime("%Y-%m-%d")
+        short_match = _MONTH_DAY_RE.match(candidate)
+        if short_match is not None:
+            month = int(short_match.group("month"))
+            day = int(short_match.group("day"))
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{month:02d}-{day:02d}"
     return text
+
+
+def _summary_date_from_values(service_date: Any, created_at: Any) -> str | None:
+    normalized = _to_date_text(service_date)
+    if normalized and _CANONICAL_FULL_DATE_RE.match(normalized):
+        return normalized
+
+    created_text = str(created_at or "").strip()
+    created_date = _to_date_text(created_text[:10]) if len(created_text) >= 10 else _to_date_text(created_text)
+    if normalized and _CANONICAL_MONTH_DAY_RE.match(normalized):
+        if created_date and _CANONICAL_FULL_DATE_RE.match(created_date):
+            return f"{created_date[:4]}-{normalized}"
+        return None
+    if created_date and _CANONICAL_FULL_DATE_RE.match(created_date):
+        return created_date
+    return None
+
+
+_FULL_DATE_RE = re.compile(r"^(?P<year>\d{4})\s*[\/\-.年]\s*(?P<month>\d{1,2})\s*[\/\-.月]\s*(?P<day>\d{1,2})\s*日?$")
+_MONTH_DAY_RE = re.compile(r"^(?P<month>\d{1,2})\s*[\/\-.月]\s*(?P<day>\d{1,2})\s*日?$")
+_CANONICAL_FULL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CANONICAL_MONTH_DAY_RE = re.compile(r"^\d{2}-\d{2}$")
 
 
 def _iso_to_epoch(text: str) -> int:

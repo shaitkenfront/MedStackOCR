@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -428,40 +429,48 @@ class InboxRepository:
             conn.commit()
 
     def get_year_summary(self, line_user_id: str, year: int) -> tuple[int, int]:
-        year_text = f"{year:04d}"
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT COALESCE(SUM(COALESCE(amount_yen, 0)), 0) AS total,
-                       COUNT(*) AS count
+                SELECT amount_yen, service_date, created_at
                 FROM aggregate_entries
                 WHERE line_user_id = ?
                   AND status IN ('tentative', 'confirmed')
-                  AND SUBSTR(COALESCE(service_date, created_at), 1, 4) = ?
                 """,
-                (line_user_id, year_text),
-            ).fetchone()
-        if row is None:
-            return 0, 0
-        return int(row["total"] or 0), int(row["count"] or 0)
+                (line_user_id,),
+            ).fetchall()
+        prefix = f"{year:04d}-"
+        total = 0
+        count = 0
+        for row in rows:
+            summary_date = _summary_date_from_values(row["service_date"], row["created_at"])
+            if not summary_date or not summary_date.startswith(prefix):
+                continue
+            total += _to_int(row["amount_yen"]) or 0
+            count += 1
+        return total, count
 
     def get_month_summary(self, line_user_id: str, year: int, month: int) -> tuple[int, int]:
-        ym = f"{year:04d}-{month:02d}"
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT COALESCE(SUM(COALESCE(amount_yen, 0)), 0) AS total,
-                       COUNT(*) AS count
+                SELECT amount_yen, service_date, created_at
                 FROM aggregate_entries
                 WHERE line_user_id = ?
                   AND status IN ('tentative', 'confirmed')
-                  AND SUBSTR(COALESCE(service_date, created_at), 1, 7) = ?
                 """,
-                (line_user_id, ym),
-            ).fetchone()
-        if row is None:
-            return 0, 0
-        return int(row["total"] or 0), int(row["count"] or 0)
+                (line_user_id,),
+            ).fetchall()
+        prefix = f"{year:04d}-{month:02d}-"
+        total = 0
+        count = 0
+        for row in rows:
+            summary_date = _summary_date_from_values(row["service_date"], row["created_at"])
+            if not summary_date or not summary_date.startswith(prefix):
+                continue
+            total += _to_int(row["amount_yen"]) or 0
+            count += 1
+        return total, count
 
     def get_pending_count(self, line_user_id: str) -> int:
         with self._connect() as conn:
@@ -1013,18 +1022,54 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+_FULL_DATE_RE = re.compile(r"^(?P<year>\d{4})\s*[\/\-.年]\s*(?P<month>\d{1,2})\s*[\/\-.月]\s*(?P<day>\d{1,2})\s*日?$")
+_MONTH_DAY_RE = re.compile(r"^(?P<month>\d{1,2})\s*[\/\-.月]\s*(?P<day>\d{1,2})\s*日?$")
+_CANONICAL_FULL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CANONICAL_MONTH_DAY_RE = re.compile(r"^\d{2}-\d{2}$")
+
+
 def _to_date_text(value: Any) -> str | None:
     text = (str(value).strip() if value is not None else "")
     if not text:
         return None
-    if "/" in text:
-        parts = text.split("/")
-        if len(parts) == 3:
+    candidates = [text]
+    if len(text) >= 10:
+        candidates.append(text[:10])
+    for candidate in candidates:
+        full_match = _FULL_DATE_RE.match(candidate)
+        if full_match is not None:
             try:
-                return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+                parsed = datetime(
+                    year=int(full_match.group("year")),
+                    month=int(full_match.group("month")),
+                    day=int(full_match.group("day")),
+                )
             except Exception:
-                return text
+                continue
+            return parsed.strftime("%Y-%m-%d")
+        short_match = _MONTH_DAY_RE.match(candidate)
+        if short_match is not None:
+            month = int(short_match.group("month"))
+            day = int(short_match.group("day"))
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{month:02d}-{day:02d}"
     return text
+
+
+def _summary_date_from_values(service_date: Any, created_at: Any) -> str | None:
+    normalized = _to_date_text(service_date)
+    if normalized and _CANONICAL_FULL_DATE_RE.match(normalized):
+        return normalized
+
+    created_text = str(created_at or "").strip()
+    created_date = _to_date_text(created_text[:10]) if len(created_text) >= 10 else _to_date_text(created_text)
+    if normalized and _CANONICAL_MONTH_DAY_RE.match(normalized):
+        if created_date and _CANONICAL_FULL_DATE_RE.match(created_date):
+            return f"{created_date[:4]}-{normalized}"
+        return None
+    if created_date and _CANONICAL_FULL_DATE_RE.match(created_date):
+        return created_date
+    return None
 
 
 def _normalize_family_name(value: Any) -> str:

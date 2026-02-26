@@ -154,7 +154,9 @@ class ReceiptExtractionPipeline:
         if family_member.source == "family_registry_unknown_surname":
             if "family_name_not_in_registry_different_surname" not in reasons:
                 reasons.append("family_name_not_in_registry_different_surname")
-            return Decision(status=DecisionStatus.REJECTED, confidence=decision.confidence, reasons=reasons)
+            if decision.status == DecisionStatus.REJECTED:
+                return decision
+            return Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=decision.confidence, reasons=reasons)
 
         if family_member.source == "family_registry_same_surname" and decision.status != DecisionStatus.REJECTED:
             if "family_name_not_in_registry_same_surname" not in reasons:

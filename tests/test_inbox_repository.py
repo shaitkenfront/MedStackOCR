@@ -245,6 +245,26 @@ class InboxRepositoryTest(unittest.TestCase):
                     self.assertEqual(reason, "user_day")
                     break
 
+    def test_aggregate_summary_includes_yearless_month_day_service_date(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            repo.upsert_aggregate_entry(
+                receipt_id="R1",
+                line_user_id="U1",
+                fields={
+                    FieldName.PAYMENT_DATE: "02-17",
+                    FieldName.PAYMENT_AMOUNT: "11,860円",
+                    FieldName.PAYER_FACILITY_NAME: "外来センター病院",
+                    FieldName.FAMILY_MEMBER_NAME: "山田 太郎",
+                },
+                status="confirmed",
+            )
+            total_y, count_y = repo.get_year_summary("U1", year)
+            total_m, count_m = repo.get_month_summary("U1", year, 2)
+            self.assertEqual((total_y, count_y), (11860, 1))
+            self.assertEqual((total_m, count_m), (11860, 1))
+
 
 def _result() -> ExtractionResult:
     return ExtractionResult(

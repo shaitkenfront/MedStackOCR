@@ -22,11 +22,11 @@ def _candidate(source: str) -> Candidate:
 
 
 class PipelineFamilyPolicyTest(unittest.TestCase):
-    def test_reject_on_different_surname(self) -> None:
+    def test_review_on_different_surname(self) -> None:
         selected = {FieldName.FAMILY_MEMBER_NAME: _candidate("family_registry_unknown_surname")}
         decision = Decision(status=DecisionStatus.AUTO_ACCEPT, confidence=0.8, reasons=["all_required_fields_present"])
         updated = ReceiptExtractionPipeline._apply_family_policy(selected, decision)  # noqa: SLF001
-        self.assertEqual(updated.status, DecisionStatus.REJECTED)
+        self.assertEqual(updated.status, DecisionStatus.REVIEW_REQUIRED)
         self.assertIn("family_name_not_in_registry_different_surname", updated.reasons)
 
     def test_review_on_same_surname(self) -> None:

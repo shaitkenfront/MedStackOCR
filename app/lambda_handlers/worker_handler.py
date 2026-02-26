@@ -17,6 +17,7 @@ from core.enums import FieldName
 from inbox.aggregate_service import AggregateService
 from inbox.conversation_service import ConversationService
 from inbox.repository_factory import create_inbox_repository
+from inbox.state_machine import STATE_AWAIT_FREE_TEXT
 from linebot import message_templates
 from linebot.media_client import LineMediaApiClient, guess_extension
 from linebot.reply_client import LineReplyClient
@@ -36,6 +37,7 @@ else:
 _ENTRY_SPLIT_RE = re.compile(r"[\r\n]+")
 _ALIAS_SPLIT_RE = re.compile(r"[,\u3001\uFF0C/\uFF0F|]+")
 _WHITESPACE_RE = re.compile(r"\s+")
+NON_DEDUCTIBLE_DETECTION_ENABLED = False
 NON_DEDUCTIBLE_KEYWORDS = (
     "ワクチン",
     "予防接種",
@@ -280,7 +282,9 @@ class LineEventWorker:
                 duplicate_key=duplicate_key,
                 limit=3,
             )
-            non_deductible_keywords = _detect_non_deductible_keywords(result)
+            non_deductible_keywords: list[str] = []
+            if NON_DEDUCTIBLE_DETECTION_ENABLED:
+                non_deductible_keywords = _detect_non_deductible_keywords(result)
             apply_year_consistency([result], self.config)
             self.repository.save_receipt_result(
                 receipt_id=receipt_id,
@@ -309,6 +313,16 @@ class LineEventWorker:
     def _handle_text_event(self, line_user_id: str, reply_token: str, text: str) -> None:
         if _is_cancel_last_registration_command(text):
             messages = self._cancel_latest_registration(line_user_id)
+            self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
+            return
+
+        active_session = self.repository.get_active_session(line_user_id)
+        if (
+            active_session is not None
+            and active_session.state == STATE_AWAIT_FREE_TEXT
+            and str(active_session.awaiting_field or "") == "__family_registration__"
+        ):
+            messages = self.conversation_service.handle_text(line_user_id, text)
             self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
             return
 

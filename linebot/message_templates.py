@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from core.enums import FieldName
@@ -20,6 +21,8 @@ EDITABLE_FIELDS = (
 )
 
 FAMILY_REGISTRATION_FINISH_TEXT = "家族氏名の登録を終了"
+_ISO_DATE_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})$")
+_SHORT_DATE_RE = re.compile(r"^(?P<month>\d{2})-(?P<day>\d{2})$")
 
 
 def _text(value: Any) -> str:
@@ -34,6 +37,17 @@ def _text(value: Any) -> str:
 
 def _field_text(field_name: str, value: Any) -> str:
     value_text = _text(value)
+    if field_name == FieldName.PAYMENT_DATE and value_text != "-":
+        full_match = _ISO_DATE_RE.match(value_text)
+        if full_match is not None:
+            return (
+                f"{full_match.group('year')}/"
+                f"{full_match.group('month')}/"
+                f"{full_match.group('day')}"
+            )
+        short_match = _SHORT_DATE_RE.match(value_text)
+        if short_match is not None:
+            return f"{short_match.group('month')}/{short_match.group('day')}"
     if field_name == FieldName.PAYMENT_AMOUNT and value_text != "-":
         return f"{value_text}円"
     return value_text
@@ -59,7 +73,7 @@ def build_auto_accept_message(receipt_id: str, fields: dict[str, Any]) -> list[d
         postback_action("保留", f"a=hold&r={receipt_id}", "保留"),
         message_action("取り消し", "取り消し"),
     ]
-    text = "自動判定で登録候補を作成しました。内容を確認してください。\n" + "\n".join(_summary_lines(fields))
+    text = "内容を確認してください。\n" + "\n".join(_summary_lines(fields))
     return [with_quick_reply(text, actions)]
 
 
@@ -107,6 +121,7 @@ def build_choose_candidate_message(
     receipt_id: str,
     field_name: str,
     candidates: list[Any],
+    include_add_family_action: bool = False,
 ) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     for idx, candidate in enumerate(candidates[:3]):
@@ -118,9 +133,13 @@ def build_choose_candidate_message(
                 label,
             )
         )
+    if include_add_family_action and field_name == FieldName.FAMILY_MEMBER_NAME:
+        actions.append(
+            postback_action("新しい家族を追加", f"a=add_family&r={receipt_id}", "新しい家族を追加")
+        )
     actions.extend(
         [
-            postback_action("手入力", f"a=free_text&r={receipt_id}&f={field_name}", "手入力"),
+            postback_action("自分で入力する", f"a=free_text&r={receipt_id}&f={field_name}", "自分で入力する"),
             postback_action("戻る", f"a=back&r={receipt_id}", "戻る"),
         ]
     )
@@ -145,7 +164,7 @@ def build_hold_message() -> list[dict[str, Any]]:
 
 
 def build_confirmed_message(fields: dict[str, Any]) -> list[dict[str, Any]]:
-    text = "確定しました。\n" + "\n".join(_summary_lines(fields))
+    text = "以下の内容で登録しました。\n" + "\n".join(_summary_lines(fields))
     return [{"type": "text", "text": text}]
 
 
