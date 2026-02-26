@@ -20,17 +20,27 @@
 
 ## 4. 判定仕様（現行）
 - 辞書一致（`canonical_name` または `aliases` 一致）: 通常判定
-- 未登録だが同姓: `REVIEW_REQUIRED`
-- 未登録かつ異姓: `REJECTED`
+- 未登録（同姓/異姓を問わない）: `REVIEW_REQUIRED`
 
-## 5. 日次運用フロー
+## 5. `REVIEW_REQUIRED` 時の氏名確認フロー
+1. 登録候補の確認メッセージを表示する。
+2. 登録済み家族氏名をクイックリプライで提示する。
+3. クイックリプライには `新しい家族を追加` を含める。
+4. 既存家族を選択した場合:
+   - 選択した氏名で `family_member_name` を更新する。
+   - OCR誤読の元文字列を、選択先家族の `aliases` に自動追加する。
+5. `新しい家族を追加` を選択した場合:
+   - 家族氏名登録フローに一時分岐する。
+   - `家族氏名の登録を終了` 後に、元の確認フローへ戻って候補選択を続行する。
+
+## 6. 日次運用フロー
 1. LINE Developers の Webhook URL を AWS API Gateway（CDK出力 `LineWebhookUrl`）に設定
 2. LINEで領収書画像を送信
-3. `REVIEW_REQUIRED` / `REJECTED` の `family_member_name` と `decision.reasons` を確認
-4. 正当な家族なら、再度名前（別表記）を送って辞書を更新
-5. 他姓ノイズなら辞書追加せずそのまま `REJECTED` を維持
+3. `REVIEW_REQUIRED` の `family_member_name` と `decision.reasons` を確認
+4. 正当な家族なら、候補選択または `新しい家族を追加` で辞書を更新
+5. ノイズ判定なら `保留` で止める（必要に応じて後で見直し）
 
-## 6. メンテナンスの目安
+## 7. メンテナンスの目安
 - 1名につき最低3〜5個の `aliases` を持つ
 - 新しいOCRエンジン・帳票形式を追加したら aliases を再点検する
 - 誤検出が続く場合は `aliases` 追加を優先し、抽出ロジック変更は最後に検討する
