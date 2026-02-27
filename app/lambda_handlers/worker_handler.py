@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from urllib.parse import parse_qs, urlparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -59,6 +59,7 @@ _CANCEL_LAST_REGISTRATION_KEYWORDS = (
     "削除",
     "失敗",
 )
+_FAMILY_REGISTRATION_AWAITING_FIELD = "__family_registration__"
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -153,16 +154,20 @@ class LineEventWorker:
 
         if event_type == "follow":
             self.repository.ensure_family_registration_started(line_user_id)
+            self._ensure_family_registration_session(line_user_id)
             self._reply(
                 line_user_id=line_user_id,
                 reply_token=reply_token,
-                messages=message_templates.build_family_registration_prompt_message(),
+                messages=message_templates.build_family_registration_prompt_message(
+                    can_finish=bool(self.repository.list_family_members(line_user_id))
+                ),
             )
             return
 
         is_family_registration_completed = self.repository.is_family_registration_completed(line_user_id)
         if not is_family_registration_completed:
             self.repository.ensure_family_registration_started(line_user_id)
+            self._ensure_family_registration_session(line_user_id)
             if event_type == "message":
                 message = event.get("message", {})
                 message_type = str(message.get("type", "") or "").lower()
@@ -176,7 +181,9 @@ class LineEventWorker:
             self._reply(
                 line_user_id=line_user_id,
                 reply_token=reply_token,
-                messages=message_templates.build_family_registration_prompt_message(),
+                messages=message_templates.build_family_registration_prompt_message(
+                    can_finish=bool(self.repository.list_family_members(line_user_id))
+                ),
             )
             return
 
@@ -320,7 +327,7 @@ class LineEventWorker:
         if (
             active_session is not None
             and active_session.state == STATE_AWAIT_FREE_TEXT
-            and str(active_session.awaiting_field or "") == "__family_registration__"
+            and str(active_session.awaiting_field or "") == _FAMILY_REGISTRATION_AWAITING_FIELD
         ):
             messages = self.conversation_service.handle_text(line_user_id, text)
             self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
@@ -335,66 +342,36 @@ class LineEventWorker:
         self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
 
     def _handle_family_registration_text(self, line_user_id: str, reply_token: str, text: str) -> None:
-        normalized = str(text or "").strip()
-        if not normalized:
-            self._reply(
-                line_user_id=line_user_id,
-                reply_token=reply_token,
-                messages=message_templates.build_family_registration_prompt_message(),
-            )
-            return
-
-        finish_keyword = message_templates.FAMILY_REGISTRATION_FINISH_TEXT
-        if normalized == finish_keyword:
-            members = self.repository.list_family_members(line_user_id)
-            if not members:
-                self._reply(
-                    line_user_id=line_user_id,
-                    reply_token=reply_token,
-                    messages=message_templates.build_family_registration_need_member_message(),
-                )
-                return
-            self.repository.complete_family_registration(line_user_id)
-            self._reply(
-                line_user_id=line_user_id,
-                reply_token=reply_token,
-                messages=message_templates.build_family_registration_completed_message(len(members)),
-            )
-            return
-
-        entries = _parse_family_registration_entries(normalized)
-        if not entries:
-            self._reply(
-                line_user_id=line_user_id,
-                reply_token=reply_token,
-                messages=message_templates.build_family_registration_prompt_message(),
-            )
-            return
-        invalid_names = _collect_missing_name_separator_canonicals(entries)
-        if invalid_names:
-            self._reply(
-                line_user_id=line_user_id,
-                reply_token=reply_token,
-                messages=message_templates.build_family_registration_need_space_message(invalid_names),
-            )
-            return
-
-        latest_names: list[str] = []
-        for canonical_name, aliases in entries:
-            member_id = self.repository.upsert_family_member(
-                line_user_id=line_user_id,
-                canonical_name=canonical_name,
-                aliases=aliases,
-            )
-            if member_id:
-                latest_names.append(canonical_name)
-
-        members = self.repository.list_family_members(line_user_id)
+        self._ensure_family_registration_session(line_user_id)
+        messages = self.conversation_service.handle_text(line_user_id, text)
         self._reply(
             line_user_id=line_user_id,
             reply_token=reply_token,
-            messages=message_templates.build_family_registration_saved_message(len(members), latest_names),
+            messages=messages,
         )
+
+    def _ensure_family_registration_session(self, line_user_id: str) -> None:
+        active_session = self.repository.get_active_session(line_user_id)
+        if (
+            active_session is not None
+            and active_session.state == STATE_AWAIT_FREE_TEXT
+            and str(active_session.awaiting_field or "") == _FAMILY_REGISTRATION_AWAITING_FIELD
+        ):
+            return
+        if active_session is not None:
+            self.repository.delete_session(active_session.session_id)
+        self.repository.upsert_session(
+            line_user_id=line_user_id,
+            receipt_id=_FAMILY_REGISTRATION_AWAITING_FIELD,
+            state=STATE_AWAIT_FREE_TEXT,
+            payload={},
+            expires_at=self._session_expires_at(),
+            awaiting_field=_FAMILY_REGISTRATION_AWAITING_FIELD,
+        )
+
+    def _session_expires_at(self) -> str:
+        ttl_minutes = max(5, int(self.inbox_conf.get("session_ttl_minutes", 60)))
+        return (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat()
 
     def _build_user_family_registry_config(self, line_user_id: str) -> dict[str, Any]:
         members = self.repository.list_family_members(line_user_id)

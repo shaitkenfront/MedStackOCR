@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from core.enums import DecisionStatus, DocumentType, FieldName
@@ -185,6 +185,94 @@ class ConversationServiceTest(unittest.TestCase):
             fields = repo.get_receipt_fields("R4")
             self.assertEqual(fields.get(FieldName.PAYMENT_DATE), f"{year}-02-17")
 
+    def test_free_text_payment_date_without_year_prompts_year_candidates(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            result = ExtractionResult(
+                document_id="doc4b",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "外来センター病院"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-01-05"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 11860),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 太郎"),
+                },
+                decision=Decision(status=DecisionStatus.AUTO_ACCEPT, confidence=0.95, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={},
+                ocr_lines=[],
+            )
+            service.handle_new_result("U4B", "R4B", result)
+            service.handle_postback("U4B", f"a=field&r=R4B&f={FieldName.PAYMENT_DATE}")
+            service.handle_postback("U4B", f"a=free_text&r=R4B&f={FieldName.PAYMENT_DATE}")
+
+            messages = service.handle_text("U4B", "２月１７日")
+            joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
+            self.assertIn("年が省略されています", joined)
+            labels = _extract_quick_reply_labels(messages)
+            self.assertIn(f"{year}/02/17", labels)
+            self.assertIn(f"{year - 1}/02/17", labels)
+
+            session = repo.get_active_session("U4B")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.state, "AWAIT_FIELD_CANDIDATE")
+            self.assertEqual(session.awaiting_field, FieldName.PAYMENT_DATE)
+
+            options = session.payload.get("candidates", {}).get(FieldName.PAYMENT_DATE, [])
+            index = options.index(f"{year}-02-17")
+            service.handle_postback("U4B", f"a=pick&r=R4B&f={FieldName.PAYMENT_DATE}&i={index}")
+            fields = repo.get_receipt_fields("R4B")
+            self.assertEqual(fields.get(FieldName.PAYMENT_DATE), f"{year}-02-17")
+
+    def test_free_text_payment_date_invalid_format_requests_reinput(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            result = ExtractionResult(
+                document_id="doc4c",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "外来センター病院"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-01-05"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 11860),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 太郎"),
+                },
+                decision=Decision(status=DecisionStatus.AUTO_ACCEPT, confidence=0.95, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={},
+                ocr_lines=[],
+            )
+            service.handle_new_result("U4C", "R4C", result)
+            service.handle_postback("U4C", f"a=field&r=R4C&f={FieldName.PAYMENT_DATE}")
+            service.handle_postback("U4C", f"a=free_text&r=R4C&f={FieldName.PAYMENT_DATE}")
+
+            messages = service.handle_text("U4C", "２０２６年２月")
+            joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
+            self.assertIn("年・月・日", joined)
+
+            session = repo.get_active_session("U4C")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.state, "AWAIT_FREE_TEXT")
+            self.assertEqual(session.awaiting_field, FieldName.PAYMENT_DATE)
+            session_fields = session.payload.get("fields", {})
+            self.assertEqual(session_fields.get(FieldName.PAYMENT_DATE), f"{year}-01-05")
+
+    def test_normalize_date_candidate_supports_japanese_formats(self) -> None:
+        self.assertEqual(ConversationService._normalize_date_candidate("２０２６年２月３日"), "2026-02-03")
+        self.assertEqual(ConversationService._normalize_date_candidate("二〇二六年二月三日"), "2026-02-03")
+        self.assertEqual(ConversationService._normalize_date_candidate("令和八年二月三日"), "2026-02-03")
+        self.assertEqual(ConversationService._normalize_date_candidate("R8.2.3"), "2026-02-03")
+        self.assertEqual(ConversationService._normalize_date_candidate("20260203"), "2026-02-03")
+
     def test_review_required_family_name_shows_registered_candidates(self) -> None:
         year = datetime.now(timezone.utc).year
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,16 +352,38 @@ class ConversationServiceTest(unittest.TestCase):
             self.assertIn("新しい家族を追加", labels)
 
             start_messages = service.handle_postback("U6", "a=add_family&r=R6")
-            self.assertIn("ご家族の名前を教えてください", str(start_messages[0].get("text", "")))
+            self.assertIn("家族の名前を1名ずつ登録します", str(start_messages[0].get("text", "")))
             session = repo.get_active_session("U6")
             self.assertIsNotNone(session)
             assert session is not None
             self.assertEqual(session.state, "AWAIT_FREE_TEXT")
             self.assertEqual(session.awaiting_field, "__family_registration__")
 
-            saved_messages = service.handle_text("U6", "佐藤 花子, サトウ ハナコ")
+            invalid_name_messages = service.handle_text("U6", "佐藤花子")
+            invalid_name_joined = "\n".join(str(m.get("text", "")) for m in invalid_name_messages if isinstance(m, dict))
+            self.assertIn("姓と名の間にスペース", invalid_name_joined)
+
+            yomi_messages = service.handle_text("U6", "佐藤 花子")
+            yomi_joined = "\n".join(str(m.get("text", "")) for m in yomi_messages if isinstance(m, dict))
+            self.assertIn("ヨミガナ", yomi_joined)
+
+            invalid_yomi_messages = service.handle_text("U6", "サトウハナコ")
+            invalid_yomi_joined = "\n".join(
+                str(m.get("text", "")) for m in invalid_yomi_messages if isinstance(m, dict)
+            )
+            self.assertIn("ヨミガナ", invalid_yomi_joined)
+            self.assertIn("姓と名の間にスペース", invalid_yomi_joined)
+
+            alias_messages = service.handle_text("U6", "サトウ ハナコ")
+            alias_joined = "\n".join(str(m.get("text", "")) for m in alias_messages if isinstance(m, dict))
+            self.assertIn("よく間違えられる表記", alias_joined)
+
+            saved_messages = service.handle_text("U6", message_templates.FAMILY_REGISTRATION_SKIP_TEXT)
             saved_joined = "\n".join(str(m.get("text", "")) for m in saved_messages if isinstance(m, dict))
             self.assertIn("登録済み", saved_joined)
+            saved_labels = _extract_quick_reply_labels(saved_messages)
+            self.assertIn(message_templates.FAMILY_REGISTRATION_NEXT_TEXT, saved_labels)
+            self.assertIn(message_templates.FAMILY_REGISTRATION_FINISH_TEXT, saved_labels)
 
             finish_messages = service.handle_text("U6", message_templates.FAMILY_REGISTRATION_FINISH_TEXT)
             finish_labels = _extract_quick_reply_labels(finish_messages)
@@ -295,6 +405,35 @@ class ConversationServiceTest(unittest.TestCase):
             sato = [item for item in members if item.get("canonical_name") == "佐藤 花子"]
             self.assertTrue(sato)
             self.assertIn("佐藤 花了", sato[0]["aliases"])
+
+    def test_family_registration_standalone_flow_completes_and_clears_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            repo.ensure_family_registration_started("U7")
+            repo.upsert_session(
+                line_user_id="U7",
+                receipt_id="__family_registration__",
+                state="AWAIT_FREE_TEXT",
+                payload={},
+                expires_at=(datetime.now(timezone.utc) + timedelta(minutes=60)).isoformat(),
+                awaiting_field="__family_registration__",
+            )
+
+            invalid_name_messages = service.handle_text("U7", "山田太郎")
+            invalid_labels = _extract_quick_reply_labels(invalid_name_messages)
+            self.assertNotIn(message_templates.FAMILY_REGISTRATION_FINISH_TEXT, invalid_labels)
+
+            service.handle_text("U7", "山田 太郎")
+            service.handle_text("U7", "ヤマダ タロウ")
+            service.handle_text("U7", message_templates.FAMILY_REGISTRATION_SKIP_TEXT)
+            completed_messages = service.handle_text("U7", message_templates.FAMILY_REGISTRATION_FINISH_TEXT)
+
+            completed_text = "\n".join(str(m.get("text", "")) for m in completed_messages if isinstance(m, dict))
+            self.assertIn("登録が完了", completed_text)
+            self.assertIn("撮影のポイント", completed_text)
+            self.assertTrue(repo.is_family_registration_completed("U7"))
+            self.assertIsNone(repo.get_active_session("U7"))
 
 
 def _extract_quick_reply_labels(messages: list[dict[str, object]]) -> list[str]:

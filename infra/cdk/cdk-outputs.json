@@ -5,7 +5,7 @@
     "LineWebhookUrl": "https://8n4axd8gv3.execute-api.ap-northeast-1.amazonaws.com/webhook/line",
     "LineEventsQueueUrl": "https://sqs.ap-northeast-1.amazonaws.com/027496193801/medstackocr-line-events.fifo",
     "OcrUsageGuardTableName": "medstackocr-ocr-usage-guard",
-    "DocAiDependenciesLayerArn": "arn:aws:lambda:ap-northeast-1:027496193801:layer:medstackocr-docai-deps:3",
+    "DocAiDependenciesLayerArn": "arn:aws:lambda:ap-northeast-1:027496193801:layer:medstackocr-docai-deps:4",
     "LearningRulesTableName": "medstackocr-learning-rules"
   }
 }

@@ -20,7 +20,10 @@ EDITABLE_FIELDS = (
     FieldName.FAMILY_MEMBER_NAME,
 )
 
-FAMILY_REGISTRATION_FINISH_TEXT = "家族氏名の登録を終了"
+FAMILY_REGISTRATION_FINISH_TEXT = "名前登録を終了する"
+FAMILY_REGISTRATION_FINISH_TEXT_LEGACY = "家族氏名の登録を終了"
+FAMILY_REGISTRATION_NEXT_TEXT = "次の名前の入力に進む"
+FAMILY_REGISTRATION_SKIP_TEXT = "該当なし"
 _ISO_DATE_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})$")
 _SHORT_DATE_RE = re.compile(r"^(?P<month>\d{2})-(?P<day>\d{2})$")
 
@@ -159,6 +162,27 @@ def build_field_updated_message(receipt_id: str, fields: dict[str, Any], field_n
     return [with_quick_reply(text, actions)]
 
 
+def build_payment_date_need_year_message() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "text",
+            "text": "年が省略されています。候補から年を選択してください。",
+        }
+    ]
+
+
+def build_payment_date_invalid_message() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "text",
+            "text": (
+                "日付は年・月・日がそろう形式で入力してください。\n"
+                "例: 2026-02-03 / 2026年2月3日 / 令和8年2月3日"
+            ),
+        }
+    ]
+
+
 def build_hold_message() -> list[dict[str, Any]]:
     return [{"type": "text", "text": "保留にしました。後で「未確認」で確認できます。"}]
 
@@ -280,49 +304,101 @@ def build_non_deductible_warning_message(keywords: list[str]) -> list[dict[str, 
     return [{"type": "text", "text": text}]
 
 
-def _family_registration_actions() -> list[dict[str, Any]]:
+def is_family_registration_finish_text(text: str) -> bool:
+    normalized = str(text or "").strip()
+    return normalized in {FAMILY_REGISTRATION_FINISH_TEXT, FAMILY_REGISTRATION_FINISH_TEXT_LEGACY}
+
+
+def _family_registration_finish_actions(can_finish: bool) -> list[dict[str, Any]]:
+    if not can_finish:
+        return []
     return [message_action(FAMILY_REGISTRATION_FINISH_TEXT, FAMILY_REGISTRATION_FINISH_TEXT)]
 
 
-def build_family_registration_prompt_message() -> list[dict[str, Any]]:
+def _family_registration_continue_actions(can_finish: bool) -> list[dict[str, Any]]:
+    actions = [message_action(FAMILY_REGISTRATION_NEXT_TEXT, FAMILY_REGISTRATION_NEXT_TEXT)]
+    if can_finish:
+        actions.append(message_action(FAMILY_REGISTRATION_FINISH_TEXT, FAMILY_REGISTRATION_FINISH_TEXT))
+    return actions
+
+
+def _family_registration_alias_actions(can_finish: bool) -> list[dict[str, Any]]:
+    actions = [message_action(FAMILY_REGISTRATION_SKIP_TEXT, FAMILY_REGISTRATION_SKIP_TEXT)]
+    if can_finish:
+        actions.append(message_action(FAMILY_REGISTRATION_FINISH_TEXT, FAMILY_REGISTRATION_FINISH_TEXT))
+    return actions
+
+
+def build_family_registration_prompt_message(can_finish: bool = True) -> list[dict[str, Any]]:
     text = (
-        "ご家族の名前を教えてください。"
-        "カタカナや、良く間違えられる漢字も登録しておくと認識の精度が上ります。\n"
+        "家族の名前を1名ずつ登録します。\n"
+        "まず、登録したい方の氏名を入力してください。\n"
         "姓と名の間にはスペースを入れてください（全角/半角どちらでも可）。\n"
-        "1行に1名、別表記は「,」区切りで登録できます。\n"
-        "例: 山田 太郎, ヤマダ タロウ, 山田太朗\n"
-        "登録が終わったら「家族氏名の登録を終了」を押してください。"
+        "例: 山田 太郎"
     )
-    return [with_quick_reply(text, _family_registration_actions())]
+    return [with_quick_reply(text, _family_registration_finish_actions(can_finish))]
 
 
-def build_family_registration_saved_message(total_members: int, latest: list[str]) -> list[dict[str, Any]]:
+def build_family_registration_yomi_prompt_message(
+    canonical_name: str,
+    can_finish: bool = True,
+) -> list[dict[str, Any]]:
+    text = (
+        f"{canonical_name}さんのヨミガナを入力してください。\n"
+        "姓と名の間にはスペースを入れてください（全角/半角どちらでも可）。\n"
+        "例: ヤマダ タロウ"
+    )
+    return [with_quick_reply(text, _family_registration_finish_actions(can_finish))]
+
+
+def build_family_registration_alias_prompt_message(
+    canonical_name: str,
+    can_finish: bool = True,
+) -> list[dict[str, Any]]:
+    text = (
+        f"{canonical_name}さんで、よく間違えられる表記があれば1つ入力してください。\n"
+        f"なければ「{FAMILY_REGISTRATION_SKIP_TEXT}」を押してください。"
+    )
+    return [with_quick_reply(text, _family_registration_alias_actions(can_finish))]
+
+
+def build_family_registration_saved_message(
+    total_members: int,
+    latest: list[str],
+    can_finish: bool = True,
+) -> list[dict[str, Any]]:
     preview = "、".join(latest[:3])
     head = f"{preview} を登録しました。\n" if preview else ""
     text = (
         f"{head}登録済み: {total_members}名\n"
-        "続けて名前を送るか、「家族氏名の登録を終了」を押してください。"
+        f"続ける場合は「{FAMILY_REGISTRATION_NEXT_TEXT}」、"
+        f"終了する場合は「{FAMILY_REGISTRATION_FINISH_TEXT}」を押してください。"
     )
-    return [with_quick_reply(text, _family_registration_actions())]
+    return [with_quick_reply(text, _family_registration_continue_actions(can_finish))]
 
 
 def build_family_registration_need_member_message() -> list[dict[str, Any]]:
     text = (
         "家族氏名が未登録です。最低1名は登録してください。\n"
-        "登録が終わったら「家族氏名の登録を終了」を押してください。"
+        "まずは1名分の氏名を入力してください。"
     )
-    return [with_quick_reply(text, _family_registration_actions())]
+    return [with_quick_reply(text, _family_registration_finish_actions(False))]
 
 
-def build_family_registration_need_space_message(invalid_names: list[str]) -> list[dict[str, Any]]:
+def build_family_registration_need_space_message(
+    invalid_names: list[str],
+    target_label: str = "名前",
+    can_finish: bool = True,
+) -> list[dict[str, Any]]:
     preview = "、".join(invalid_names[:3])
     head = f"入力を確認してください: {preview}\n" if preview else ""
+    example = "ヤマダ タロウ" if "ヨミ" in target_label else "山田 太郎"
     text = (
-        f"{head}姓と名の間にスペースを入れて再登録してください。\n"
+        f"{head}{target_label}は姓と名の間にスペースを入れて再入力してください。\n"
         "全角/半角スペースはどちらでも入力できます（内部では半角スペースに正規化します）。\n"
-        "例: 山田 太郎"
+        f"例: {example}"
     )
-    return [with_quick_reply(text, _family_registration_actions())]
+    return [with_quick_reply(text, _family_registration_finish_actions(can_finish))]
 
 
 def build_family_registration_completed_message(total_members: int) -> list[dict[str, Any]]:
@@ -332,3 +408,17 @@ def build_family_registration_completed_message(total_members: int) -> list[dict
             "text": f"家族氏名の登録が完了しました（{total_members}名）。領収書画像を送信してください。",
         }
     ]
+
+
+def build_photo_registration_start_message(total_members: int) -> list[dict[str, Any]]:
+    text = (
+        f"家族氏名の登録が完了しました（{total_members}名）。\n"
+        "このあと領収書画像を送信してください。\n"
+        "撮影のポイント（こうすると文字の認識がうまくいきます）:\n"
+        "- なるべく真上から撮影する\n"
+        "- 複数の領収書を並べたり重ねたりしない\n"
+        "- なるべく明るい場所で撮影する\n"
+        "- 領収書が白飛びしないようにする\n"
+        "- なるべく画角いっぱいに領収書を収める"
+    )
+    return [{"type": "text", "text": text}]
