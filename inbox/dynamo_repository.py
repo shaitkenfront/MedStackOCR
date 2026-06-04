@@ -687,6 +687,9 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
             receipt_id = str(item.get("receipt_id", "") or "").strip()
             if not receipt_id:
                 continue
+            aggregate = self._find_aggregate_by_receipt(receipt_id)
+            if str((aggregate or {}).get("status", "") or "") != "confirmed":
+                continue
             duplicates.append(
                 {
                     "receipt_id": receipt_id,

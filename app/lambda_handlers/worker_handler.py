@@ -293,18 +293,15 @@ class LineEventWorker:
             if NON_DEDUCTIBLE_DETECTION_ENABLED:
                 non_deductible_keywords = _detect_non_deductible_keywords(result)
             apply_year_consistency([result], self.config)
-            self.repository.save_receipt_result(
-                receipt_id=receipt_id,
-                line_user_id=line_user_id,
-                line_message_id=message_id,
-                image_path=image_path,
-                image_sha256=image_sha256,
-                result=result,
-            )
             messages = self.conversation_service.handle_new_result(
                 line_user_id=line_user_id,
                 receipt_id=receipt_id,
                 result=result,
+                pending_receipt={
+                    "line_message_id": message_id,
+                    "image_path": image_path,
+                    "image_sha256": image_sha256,
+                },
             )
             if duplicates:
                 messages.extend(message_templates.build_duplicate_warning_message(receipt_id=receipt_id, duplicates=duplicates))
@@ -318,12 +315,12 @@ class LineEventWorker:
                 pass
 
     def _handle_text_event(self, line_user_id: str, reply_token: str, text: str) -> None:
+        active_session = self.repository.get_active_session(line_user_id)
         if _is_cancel_last_registration_command(text):
             messages = self._cancel_latest_registration(line_user_id)
             self._reply(line_user_id=line_user_id, reply_token=reply_token, messages=messages)
             return
 
-        active_session = self.repository.get_active_session(line_user_id)
         if (
             active_session is not None
             and active_session.state == STATE_AWAIT_FREE_TEXT
@@ -417,6 +414,16 @@ class LineEventWorker:
         image_path = self.repository.delete_receipt(line_user_id=line_user_id, receipt_id=receipt_id)
         if image_path:
             self._delete_stored_image(image_path)
+        else:
+            session = self.repository.get_active_session(line_user_id)
+            if session is not None and session.receipt_id == receipt_id:
+                pending = session.payload.get("pending_receipt") if isinstance(session.payload, dict) else None
+                pending_image_path = ""
+                if isinstance(pending, dict):
+                    pending_image_path = str(pending.get("image_path", "") or "").strip()
+                if pending_image_path:
+                    self._delete_stored_image(pending_image_path)
+                self.repository.delete_session(session.session_id)
         return message_templates.build_duplicate_deleted_message()
 
     def _cancel_latest_registration(self, line_user_id: str) -> list[dict[str, Any]]:

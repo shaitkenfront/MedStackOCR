@@ -183,6 +183,10 @@ def build_payment_date_invalid_message() -> list[dict[str, Any]]:
     ]
 
 
+def build_payment_amount_invalid_message() -> list[dict[str, Any]]:
+    return [{"type": "text", "text": "金額は数字を含む形式で入力してください。\n例: 1200 / 1,200円"}]
+
+
 def build_hold_message() -> list[dict[str, Any]]:
     return [{"type": "text", "text": "保留にしました。後で「未確認」で確認できます。"}]
 

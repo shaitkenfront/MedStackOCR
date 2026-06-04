@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import parse_qs
 
-from core.enums import DecisionStatus, FieldName
-from core.models import ExtractionResult
+from core.enums import DecisionStatus, DocumentType, FieldName
+from core.models import AuditInfo, Candidate, Decision, ExtractionResult, TemplateMatch
 from inbox.models import ConversationSession
 from inbox.repository_interface import InboxRepositoryProtocol
 from inbox.state_machine import (
@@ -47,6 +48,7 @@ _MONTH_DAY_SEPARATED_RE = re.compile(
 _MONTH_DAY_JP_RE = re.compile(
     r"^(?P<month>[0-9〇零一二三四五六七八九十百千万元]{1,3})月(?P<day>[0-9〇零一二三四五六七八九十百千万元]{1,3})日?$"
 )
+_CANDIDATE_LABEL_RE = re.compile(r"^候補(?P<index>[1-9]\d*)$")
 _ERA_SEPARATED_RE = re.compile(
     r"^(?P<era>[RrHhSs])(?P<year>[0-9〇零一二三四五六七八九十百千万元]{1,4})[\/\.\-](?P<month>[0-9〇零一二三四五六七八九十百千万元]{1,3})[\/\.\-](?P<day>[0-9〇零一二三四五六七八九十百千万元]{1,3})$"
 )
@@ -88,6 +90,7 @@ _ERA_YEAR_OFFSETS = {
 _ENTRY_SPLIT_RE = re.compile(r"[\r\n]+")
 _ALIAS_SPLIT_RE = re.compile(r"[,\u3001\uFF0C/\uFF0F|]+")
 _WHITESPACE_RE = re.compile(r"\s+")
+_FAMILY_NAME_KEY_RE = re.compile(r"[\s　・･\.]")
 _FAMILY_REGISTRATION_AWAITING_FIELD = "__family_registration__"
 _FAMILY_REGISTRATION_PAYLOAD_KEY = "family_registration"
 _FAMILY_REGISTRATION_STEP_NAME = "name"
@@ -118,9 +121,11 @@ class ConversationService:
         line_user_id: str,
         receipt_id: str,
         result: ExtractionResult,
+        pending_receipt: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         fields = self._fields_from_result(result)
         candidates = self._candidates_from_result(result)
+        pending_payload = self._pending_receipt_payload(result=result, metadata=pending_receipt)
         learning_messages = self._apply_learning_hints(
             line_user_id=line_user_id,
             receipt_id=receipt_id,
@@ -144,20 +149,18 @@ class ConversationService:
         decision = result.decision.status.value
 
         if decision == DecisionStatus.AUTO_ACCEPT.value:
-            self.repository.upsert_aggregate_entry(
-                receipt_id=receipt_id,
-                line_user_id=line_user_id,
-                fields=fields,
-                status="tentative",
-            )
             payload = {"fields": fields, "candidates": candidates, "decision": decision}
+            if pending_payload:
+                payload["pending_receipt"] = pending_payload
+            state = STATE_AWAIT_FIELD_CANDIDATE if needs_date_confirmation else STATE_AWAIT_CONFIRM
+            awaiting_field = FieldName.PAYMENT_DATE if needs_date_confirmation else None
             self.repository.upsert_session(
                 line_user_id=line_user_id,
                 receipt_id=receipt_id,
-                state=STATE_AWAIT_FIELD_CANDIDATE if needs_date_confirmation else STATE_AWAIT_CONFIRM,
+                state=state,
                 payload=payload,
                 expires_at=self._expires_at(),
-                awaiting_field=FieldName.PAYMENT_DATE if needs_date_confirmation else None,
+                awaiting_field=awaiting_field,
             )
             messages = message_templates.build_auto_accept_message(receipt_id=receipt_id, fields=fields)
             if needs_date_confirmation:
@@ -178,13 +181,9 @@ class ConversationService:
             return messages
 
         if decision == DecisionStatus.REVIEW_REQUIRED.value:
-            self.repository.upsert_aggregate_entry(
-                receipt_id=receipt_id,
-                line_user_id=line_user_id,
-                fields=fields,
-                status="tentative",
-            )
             payload = {"fields": fields, "candidates": candidates, "decision": decision}
+            if pending_payload:
+                payload["pending_receipt"] = pending_payload
             review_state = STATE_AWAIT_CONFIRM
             review_awaiting_field: str | None = None
             if needs_family_confirmation:
@@ -234,12 +233,6 @@ class ConversationService:
             messages.extend(learning_messages)
             return messages
 
-        self.repository.upsert_aggregate_entry(
-            receipt_id=receipt_id,
-            line_user_id=line_user_id,
-            fields=fields,
-            status="hold",
-        )
         return message_templates.build_rejected_message()
 
     def handle_postback(self, line_user_id: str, data: str) -> list[dict[str, Any]]:
@@ -257,7 +250,17 @@ class ConversationService:
 
         if action == "hold":
             if receipt_id:
-                self.repository.set_aggregate_status(receipt_id, "hold")
+                active_fields = self._session_fields(session) if session else self.repository.get_receipt_fields(receipt_id)
+                if session:
+                    self._save_pending_receipt_if_needed(session=session, fields=active_fields)
+                    self.repository.upsert_aggregate_entry(
+                        receipt_id=session.receipt_id,
+                        line_user_id=line_user_id,
+                        fields=active_fields,
+                        status="hold",
+                    )
+                else:
+                    self.repository.set_aggregate_status(receipt_id, "hold")
             if session:
                 self.repository.delete_session(session.session_id)
             return message_templates.build_hold_message()
@@ -268,6 +271,8 @@ class ConversationService:
             if not receipt_id:
                 return message_templates.build_unknown_message()
             fields = self._session_fields(session) or self.repository.get_receipt_fields(receipt_id)
+            if session:
+                self._save_pending_receipt_if_needed(session=session, fields=fields)
             self.repository.upsert_aggregate_entry(
                 receipt_id=receipt_id,
                 line_user_id=line_user_id,
@@ -347,7 +352,6 @@ class ConversationService:
             previous_value = fields.get(field_name)
             fields[field_name] = candidates[index]
             session.payload["fields"] = fields
-            self.repository.update_field_value(session.receipt_id, field_name, fields[field_name])
             if field_name == FieldName.FAMILY_MEMBER_NAME:
                 self._add_family_alias_if_needed(
                     line_user_id=line_user_id,
@@ -359,12 +363,6 @@ class ConversationService:
                 field_name=field_name,
                 context_key=self._learning_context_key(fields),
                 corrected_value=fields[field_name],
-            )
-            self.repository.upsert_aggregate_entry(
-                receipt_id=session.receipt_id,
-                line_user_id=line_user_id,
-                fields=fields,
-                status="tentative",
             )
             self._save_session(
                 session=session,
@@ -415,78 +413,18 @@ class ConversationService:
 
     def handle_text(self, line_user_id: str, text: str) -> list[dict[str, Any]]:
         session = self.repository.get_active_session(line_user_id)
+        normalized = (text or "").strip()
         if session is None:
             return message_templates.build_unknown_message()
-
-        normalized = (text or "").strip()
         if not normalized:
             return message_templates.build_unknown_message()
 
         if session.state == STATE_AWAIT_FREE_TEXT and session.awaiting_field in EDITABLE_FIELDS:
-            field_name = str(session.awaiting_field)
-            fields = self._session_fields(session)
-            previous_value = fields.get(field_name)
-            if field_name == FieldName.PAYMENT_DATE:
-                date_kind, date_value = self._resolve_date_input_for_manual_update(normalized)
-                if date_kind == "invalid":
-                    return message_templates.build_payment_date_invalid_message()
-                if date_kind == "missing_year":
-                    options = list(date_value) if isinstance(date_value, list) else []
-                    if not options:
-                        return message_templates.build_payment_date_invalid_message()
-                    payload = dict(session.payload) if isinstance(session.payload, dict) else {}
-                    candidates = self._session_candidates(session)
-                    candidates[FieldName.PAYMENT_DATE] = options
-                    payload["fields"] = fields
-                    payload["candidates"] = candidates
-                    self._save_session(
-                        session=session,
-                        state=STATE_AWAIT_FIELD_CANDIDATE,
-                        payload=payload,
-                        awaiting_field=FieldName.PAYMENT_DATE,
-                    )
-                    messages = message_templates.build_payment_date_need_year_message()
-                    messages.extend(
-                        message_templates.build_choose_candidate_message(
-                            receipt_id=session.receipt_id,
-                            field_name=FieldName.PAYMENT_DATE,
-                            candidates=options,
-                        )
-                    )
-                    return messages
-                fields[field_name] = str(date_value)
-            else:
-                fields[field_name] = self._normalize_text_value(field_name, normalized)
-            session.payload["fields"] = fields
-            self.repository.update_field_value(session.receipt_id, field_name, fields[field_name])
-            if field_name == FieldName.FAMILY_MEMBER_NAME:
-                self._add_family_alias_if_needed(
-                    line_user_id=line_user_id,
-                    raw_value=previous_value,
-                    corrected_value=fields[field_name],
-                )
-            self.repository.record_field_correction(
+            return self._handle_manual_field_text(
                 line_user_id=line_user_id,
-                field_name=field_name,
-                context_key=self._learning_context_key(fields),
-                corrected_value=fields[field_name],
-            )
-            self.repository.upsert_aggregate_entry(
-                receipt_id=session.receipt_id,
-                line_user_id=line_user_id,
-                fields=fields,
-                status="tentative",
-            )
-            self._save_session(
                 session=session,
-                state=STATE_AWAIT_CONFIRM,
-                payload=session.payload,
-                awaiting_field=None,
-            )
-            return message_templates.build_field_updated_message(
-                receipt_id=session.receipt_id,
-                fields=fields,
-                field_name=field_name,
+                field_name=str(session.awaiting_field),
+                text=normalized,
             )
 
         if (
@@ -503,10 +441,208 @@ class ConversationService:
         if action is not None:
             return self.handle_postback(line_user_id, action)
 
+        if session.state == STATE_AWAIT_FIELD_CANDIDATE and session.awaiting_field in EDITABLE_FIELDS:
+            field_name = str(session.awaiting_field)
+            if normalized == "自分で入力する":
+                return self.handle_postback(
+                    line_user_id,
+                    f"a=free_text&r={session.receipt_id}&f={field_name}",
+                )
+            candidate_index = self._candidate_index_from_text(
+                normalized,
+                len(self._session_candidates(session).get(field_name, [])),
+            )
+            if candidate_index is not None:
+                return self.handle_postback(
+                    line_user_id,
+                    f"a=pick&r={session.receipt_id}&f={field_name}&i={candidate_index}",
+                )
+            if normalized in FIELD_NAME_BY_LABEL:
+                return message_templates.build_unknown_message()
+            return self._handle_manual_field_text(
+                line_user_id=line_user_id,
+                session=session,
+                field_name=field_name,
+                text=normalized,
+            )
+
         field_name = FIELD_NAME_BY_LABEL.get(normalized)
         if session.state == STATE_AWAIT_FIELD_SELECTION and field_name in EDITABLE_FIELDS:
             return self.handle_postback(line_user_id, f"a=field&r={session.receipt_id}&f={field_name}")
         return message_templates.build_unknown_message()
+
+    def _handle_manual_field_text(
+        self,
+        *,
+        line_user_id: str,
+        session: ConversationSession,
+        field_name: str,
+        text: str,
+    ) -> list[dict[str, Any]]:
+        fields = self._session_fields(session)
+        previous_value = fields.get(field_name)
+        if field_name == FieldName.PAYMENT_DATE:
+            date_kind, date_value = self._resolve_date_input_for_manual_update(text)
+            if date_kind == "invalid":
+                return message_templates.build_payment_date_invalid_message()
+            if date_kind == "missing_year":
+                options = list(date_value) if isinstance(date_value, list) else []
+                if not options:
+                    return message_templates.build_payment_date_invalid_message()
+                payload = dict(session.payload) if isinstance(session.payload, dict) else {}
+                candidates = self._session_candidates(session)
+                candidates[FieldName.PAYMENT_DATE] = options
+                payload["fields"] = fields
+                payload["candidates"] = candidates
+                self._save_session(
+                    session=session,
+                    state=STATE_AWAIT_FIELD_CANDIDATE,
+                    payload=payload,
+                    awaiting_field=FieldName.PAYMENT_DATE,
+                )
+                messages = message_templates.build_payment_date_need_year_message()
+                messages.extend(
+                    message_templates.build_choose_candidate_message(
+                        receipt_id=session.receipt_id,
+                        field_name=FieldName.PAYMENT_DATE,
+                        candidates=options,
+                    )
+                )
+                return messages
+            fields[field_name] = str(date_value)
+        else:
+            normalized_value = self._normalize_text_value(field_name, text)
+            if field_name == FieldName.PAYMENT_AMOUNT and not isinstance(normalized_value, int):
+                return message_templates.build_payment_amount_invalid_message()
+            if field_name == FieldName.FAMILY_MEMBER_NAME:
+                normalized_value = self._resolve_family_member_value(
+                    line_user_id=line_user_id,
+                    value=normalized_value,
+                )
+            fields[field_name] = normalized_value
+
+        session.payload["fields"] = fields
+        if field_name == FieldName.FAMILY_MEMBER_NAME:
+            self._add_family_alias_if_needed(
+                line_user_id=line_user_id,
+                raw_value=previous_value,
+                corrected_value=fields[field_name],
+            )
+        self.repository.record_field_correction(
+            line_user_id=line_user_id,
+            field_name=field_name,
+            context_key=self._learning_context_key(fields),
+            corrected_value=fields[field_name],
+        )
+        self._save_session(
+            session=session,
+            state=STATE_AWAIT_CONFIRM,
+            payload=session.payload,
+            awaiting_field=None,
+        )
+        return message_templates.build_field_updated_message(
+            receipt_id=session.receipt_id,
+            fields=fields,
+            field_name=field_name,
+        )
+
+    @staticmethod
+    def _pending_receipt_payload(
+        *,
+        result: ExtractionResult,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        raw = metadata if isinstance(metadata, dict) else {}
+        payload: dict[str, Any] = {
+            "document_id": result.document_id,
+            "document_type": result.document_type.value,
+            "household_id": result.household_id,
+            "decision": result.decision.status.value,
+            "decision_confidence": result.decision.confidence,
+            "decision_reasons": list(result.decision.reasons),
+        }
+        for key in ("line_message_id", "image_path", "image_sha256"):
+            value = str(raw.get(key, "") or "").strip()
+            if value:
+                payload[key] = value
+        return payload
+
+    def _save_pending_receipt_if_needed(
+        self,
+        *,
+        session: ConversationSession,
+        fields: dict[str, Any],
+    ) -> None:
+        payload = dict(session.payload) if isinstance(session.payload, dict) else {}
+        pending = payload.get("pending_receipt")
+        if not isinstance(pending, dict):
+            return
+        line_message_id = str(pending.get("line_message_id", "") or "").strip()
+        image_path = str(pending.get("image_path", "") or "").strip()
+        image_sha256 = str(pending.get("image_sha256", "") or "").strip()
+        if not line_message_id or not image_path or not image_sha256:
+            return
+
+        self.repository.save_receipt_result(
+            receipt_id=session.receipt_id,
+            line_user_id=session.line_user_id,
+            line_message_id=line_message_id,
+            image_path=image_path,
+            image_sha256=image_sha256,
+            result=self._build_result_for_persist(session=session, fields=fields, pending=pending),
+        )
+        payload.pop("pending_receipt", None)
+        payload["receipt_saved"] = True
+        payload["fields"] = fields
+        session.payload = payload
+
+    def _build_result_for_persist(
+        self,
+        *,
+        session: ConversationSession,
+        fields: dict[str, Any],
+        pending: dict[str, Any],
+    ) -> ExtractionResult:
+        status_text = str(pending.get("decision", "") or self._decision_from_payload(session.payload))
+        try:
+            decision_status = DecisionStatus(status_text)
+        except ValueError:
+            decision_status = DecisionStatus.REVIEW_REQUIRED
+        document_type_text = str(pending.get("document_type", "") or DocumentType.UNKNOWN.value)
+        try:
+            document_type = DocumentType(document_type_text)
+        except ValueError:
+            document_type = DocumentType.UNKNOWN
+        confidence = self._safe_float(pending.get("decision_confidence"), 0.0)
+        reasons = pending.get("decision_reasons")
+        decision_reasons = [str(reason) for reason in reasons] if isinstance(reasons, list) else ["line_confirmed"]
+        candidates: dict[str, Candidate | None] = {}
+        for field_name, value in fields.items():
+            if value in (None, ""):
+                candidates[field_name] = None
+                continue
+            candidates[field_name] = Candidate(
+                field=field_name,
+                value_raw=value,
+                value_normalized=value,
+                source_line_indices=[],
+                bbox=None,
+                score=0.0,
+                ocr_confidence=1.0,
+                reasons=["saved_after_line_confirmation"],
+                source="line_confirmed",
+            )
+        return ExtractionResult(
+            document_id=str(pending.get("document_id", "") or session.receipt_id),
+            household_id=str(pending.get("household_id", "") or "") or None,
+            document_type=document_type,
+            template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+            fields=candidates,
+            decision=Decision(status=decision_status, confidence=confidence, reasons=decision_reasons),
+            audit=AuditInfo(engine="line", engine_version="n/a", pipeline_version="n/a"),
+            candidate_pool={},
+            ocr_lines=[],
+        )
 
     @staticmethod
     def _fields_from_result(result: ExtractionResult) -> dict[str, Any]:
@@ -558,6 +694,23 @@ class ConversationService:
             return int(text)
         except Exception:
             return None
+
+    @staticmethod
+    def _safe_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _candidate_index_from_text(text: str, candidate_count: int) -> int | None:
+        match = _CANDIDATE_LABEL_RE.match(str(text or "").strip())
+        if match is None:
+            return None
+        index = int(match.group("index")) - 1
+        if 0 <= index < min(candidate_count, 3):
+            return index
+        return None
 
     @staticmethod
     def _session_fields(session: ConversationSession | None) -> dict[str, Any]:
@@ -714,7 +867,6 @@ class ConversationService:
         if str(current or "") == str(hint):
             return []
         fields[field_name] = hint
-        self.repository.update_field_value(receipt_id, field_name, hint, source="learning_hint")
         return [
             {
                 "type": "text",
@@ -769,15 +921,142 @@ class ConversationService:
             seen.add(normalized)
             options.append(normalized)
 
-        for member in self.repository.list_family_members(line_user_id):
+        members = self.repository.list_family_members(line_user_id)
+        detected_values = [fields.get(FieldName.FAMILY_MEMBER_NAME), *candidates.get(FieldName.FAMILY_MEMBER_NAME, [])]
+        for member in self._rank_family_members_by_name(members, detected_values):
             add_option(member.get("canonical_name"))
             if len(options) >= max_options:
                 return options
-        for value in [fields.get(FieldName.FAMILY_MEMBER_NAME), *candidates.get(FieldName.FAMILY_MEMBER_NAME, [])]:
+
+        for member in members:
+            add_option(member.get("canonical_name"))
+            if len(options) >= max_options:
+                return options
+        for value in detected_values:
             add_option(value)
             if len(options) >= max_options:
                 return options
         return options
+
+    def _resolve_family_member_value(self, *, line_user_id: str, value: Any) -> str:
+        normalized = self._normalize_family_name(value)
+        if not normalized:
+            return ""
+        matched = self._find_family_member_by_name(
+            self.repository.list_family_members(line_user_id),
+            [normalized],
+            allow_fuzzy=True,
+            allow_surname=False,
+        )
+        if matched is None:
+            return normalized
+        canonical = self._normalize_family_name(matched.get("canonical_name"))
+        return canonical or normalized
+
+    def _rank_family_members_by_name(
+        self,
+        members: list[dict[str, Any]],
+        values: list[Any],
+    ) -> list[dict[str, Any]]:
+        ranked: list[tuple[tuple[int, float], int, dict[str, Any]]] = []
+        for index, member in enumerate(members):
+            score = self._family_member_match_score(
+                member,
+                values,
+                allow_fuzzy=True,
+                allow_surname=True,
+            )
+            if score is None:
+                continue
+            ranked.append((score, index, member))
+        return [member for _, _, member in sorted(ranked, key=lambda item: (item[0], item[1]))]
+
+    def _find_family_member_by_name(
+        self,
+        members: list[dict[str, Any]],
+        values: list[Any],
+        *,
+        allow_fuzzy: bool,
+        allow_surname: bool,
+    ) -> dict[str, Any] | None:
+        ranked: list[tuple[tuple[int, float], int, dict[str, Any]]] = []
+        for index, member in enumerate(members):
+            score = self._family_member_match_score(
+                member,
+                values,
+                allow_fuzzy=allow_fuzzy,
+                allow_surname=allow_surname,
+            )
+            if score is None:
+                continue
+            ranked.append((score, index, member))
+        if not ranked:
+            return None
+        return sorted(ranked, key=lambda item: (item[0], item[1]))[0][2]
+
+    def _family_member_match_score(
+        self,
+        member: dict[str, Any],
+        values: list[Any],
+        *,
+        allow_fuzzy: bool,
+        allow_surname: bool,
+    ) -> tuple[int, float] | None:
+        target_keys = [self._family_name_lookup_key(value) for value in values]
+        target_keys = [key for key in target_keys if key]
+        if not target_keys:
+            return None
+
+        member_keys = [self._family_name_lookup_key(value) for value in self._family_member_names(member)]
+        member_keys = [key for key in member_keys if key]
+        if not member_keys:
+            return None
+
+        if set(target_keys) & set(member_keys):
+            return (0, 0.0)
+
+        if allow_fuzzy:
+            best_similarity = 0.0
+            for target_key in target_keys:
+                for member_key in member_keys:
+                    similarity = SequenceMatcher(None, target_key, member_key).ratio()
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+            if best_similarity >= 0.85:
+                return (1, -best_similarity)
+
+        if allow_surname:
+            target_surnames = {self._family_surname_key(value) for value in values}
+            target_surnames = {key for key in target_surnames if key}
+            member_surnames = {self._family_surname_key(value) for value in self._family_member_names(member)}
+            member_surnames = {key for key in member_surnames if key}
+            if target_surnames & member_surnames:
+                return (2, 0.0)
+        return None
+
+    @staticmethod
+    def _family_member_names(member: dict[str, Any]) -> list[Any]:
+        names: list[Any] = [member.get("canonical_name")]
+        aliases = member.get("aliases")
+        if isinstance(aliases, list):
+            names.extend(aliases)
+        return names
+
+    @staticmethod
+    def _family_name_lookup_key(value: Any) -> str:
+        normalized = ConversationService._normalize_family_name(value)
+        if normalized.endswith(("様", "殿")):
+            normalized = normalized[:-1].strip()
+        return _FAMILY_NAME_KEY_RE.sub("", normalized).lower()
+
+    @staticmethod
+    def _family_surname_key(value: Any) -> str:
+        normalized = ConversationService._normalize_family_name(value)
+        if not normalized:
+            return ""
+        parts = normalized.split(" ")
+        surname = parts[0] if len(parts) >= 2 and parts[0] else normalized[:2]
+        return ConversationService._family_name_lookup_key(surname)
 
     def _add_family_alias_if_needed(
         self,
@@ -790,6 +1069,16 @@ class ConversationService:
         canonical = self._normalize_family_name(corrected_value)
         if not alias or not canonical or alias == canonical:
             return
+        matched = self._find_family_member_by_name(
+            self.repository.list_family_members(line_user_id),
+            [canonical],
+            allow_fuzzy=False,
+            allow_surname=False,
+        )
+        if matched is not None:
+            matched_canonical = self._normalize_family_name(matched.get("canonical_name"))
+            if matched_canonical:
+                canonical = matched_canonical
         self.repository.upsert_family_member(
             line_user_id=line_user_id,
             canonical_name=canonical,

@@ -770,23 +770,24 @@ class InboxRepository:
         if not user_id:
             return []
 
-        where_parts = ["line_user_id = ?"]
+        where_parts = ["r.line_user_id = ?"]
         params: list[Any] = [user_id]
         conditions: list[str] = []
         if image_hash:
-            conditions.append("image_sha256 = ?")
+            conditions.append("r.image_sha256 = ?")
             params.append(image_hash)
         if normalized_key:
-            conditions.append("duplicate_key = ?")
+            conditions.append("r.duplicate_key = ?")
             params.append(normalized_key)
         if not conditions:
             return []
         where_parts.append("(" + " OR ".join(conditions) + ")")
         sql = (
-            "SELECT receipt_id, image_sha256, duplicate_key, created_at "
-            "FROM receipts "
+            "SELECT r.receipt_id, r.image_sha256, r.duplicate_key, r.created_at "
+            "FROM receipts r "
+            "JOIN aggregate_entries a ON a.receipt_id = r.receipt_id AND a.status = 'confirmed' "
             f"WHERE {' AND '.join(where_parts)} "
-            "ORDER BY created_at DESC "
+            "ORDER BY r.created_at DESC "
             "LIMIT ?"
         )
         params.append(max_items * 2)

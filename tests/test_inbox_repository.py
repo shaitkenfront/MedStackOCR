@@ -168,6 +168,19 @@ class InboxRepositoryTest(unittest.TestCase):
             fields = repo.get_receipt_fields("R1")
             duplicate_key = "2026-02-01|テスト医院|山田太郎|1000"
             dupes_by_hash = repo.find_potential_duplicates("U1", "sha-1", None, limit=3)
+            self.assertEqual(dupes_by_hash, [])
+            repo.upsert_aggregate_entry(
+                receipt_id="R1",
+                line_user_id="U1",
+                fields={
+                    FieldName.PAYMENT_DATE: "2026-02-01",
+                    FieldName.PAYMENT_AMOUNT: 1000,
+                    FieldName.PAYER_FACILITY_NAME: "テスト医院",
+                    FieldName.FAMILY_MEMBER_NAME: "山田 太郎",
+                },
+                status="confirmed",
+            )
+            dupes_by_hash = repo.find_potential_duplicates("U1", "sha-1", None, limit=3)
             self.assertEqual(len(dupes_by_hash), 1)
             dupes_by_key = repo.find_potential_duplicates("U1", "other", duplicate_key, limit=3)
             self.assertEqual(len(dupes_by_key), 1)

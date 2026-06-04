@@ -29,7 +29,7 @@ class LineReplyClient:
         if not messages:
             return
 
-        payload = {"replyToken": token, "messages": messages[:5]}
+        payload = {"replyToken": token, "messages": self._prepare_messages(messages)}
         self._post_json("/v2/bot/message/reply", payload)
 
     def push(self, to: str, messages: list[dict[str, Any]]) -> None:
@@ -41,8 +41,20 @@ class LineReplyClient:
         if not messages:
             return
 
-        payload = {"to": target, "messages": messages[:5]}
+        payload = {"to": target, "messages": self._prepare_messages(messages)}
         self._post_json("/v2/bot/message/push", payload)
+
+    @staticmethod
+    def _prepare_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared = [dict(message) for message in messages[:5]]
+        last_quick_reply: dict[str, Any] | None = None
+        for message in prepared:
+            quick_reply = message.pop("quickReply", None)
+            if isinstance(quick_reply, dict):
+                last_quick_reply = quick_reply
+        if prepared and last_quick_reply is not None:
+            prepared[-1]["quickReply"] = last_quick_reply
+        return prepared
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -64,4 +76,3 @@ class LineReplyClient:
             raise LineMessagingApiError(f"line api error: status={exc.code} body={body}") from exc
         except error.URLError as exc:
             raise LineMessagingApiError(f"line api connection error: {exc}") from exc
-

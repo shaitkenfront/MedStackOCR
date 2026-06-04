@@ -160,18 +160,15 @@ class LineWebhookHandler:
             ocr_engine=engine_name,
         )
         apply_year_consistency([result], self._runtime_config)
-        self.repository.save_receipt_result(
-            receipt_id=receipt_id,
-            line_user_id=line_user_id,
-            line_message_id=message_id,
-            image_path=str(image_path),
-            image_sha256=image_sha256,
-            result=result,
-        )
         messages = self.conversation_service.handle_new_result(
             line_user_id=line_user_id,
             receipt_id=receipt_id,
             result=result,
+            pending_receipt={
+                "line_message_id": message_id,
+                "image_path": str(image_path),
+                "image_sha256": image_sha256,
+            },
         )
         self._reply(reply_token, messages)
         return True

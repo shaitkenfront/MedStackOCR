@@ -58,7 +58,7 @@ class ConversationServiceTest(unittest.TestCase):
                 ocr_lines=[],
             )
 
-            service.handle_new_result("U1", "R1", result)
+            service.handle_new_result("U1", "R1", result, pending_receipt=_pending_metadata("R1"))
             session = repo.get_active_session("U1")
             self.assertIsNotNone(session)
 
@@ -66,14 +66,176 @@ class ConversationServiceTest(unittest.TestCase):
             candidate_labels = _extract_quick_reply_labels(candidate_messages)
             self.assertIn("自分で入力する", candidate_labels)
             service.handle_postback("U1", f"a=pick&r=R1&f={FieldName.PAYMENT_AMOUNT}&i=1")
-            fields = repo.get_receipt_fields("R1")
-            self.assertEqual(fields.get(FieldName.PAYMENT_AMOUNT), 1200)
+            self.assertEqual(repo.get_receipt_fields("R1"), {})
+            session = repo.get_active_session("U1")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.payload.get("fields", {}).get(FieldName.PAYMENT_AMOUNT), 1200)
 
             messages = service.handle_postback("U1", "a=ok&r=R1")
             self.assertIsNone(repo.get_active_session("U1"))
+            fields = repo.get_receipt_fields("R1")
+            self.assertEqual(fields.get(FieldName.PAYMENT_AMOUNT), 1200)
             total, count = repo.get_year_summary("U1", year)
             self.assertEqual((total, count), (1200, 1))
             _assert_cumulative_message(messages, expected_current_year_total=1200)
+
+    def test_candidate_wait_accepts_direct_amount_input(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            result = ExtractionResult(
+                document_id="doc-direct-amount",
+                household_id=None,
+                document_type=DocumentType.PHARMACY,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "テスト薬局"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-02-20"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 1000),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 太郎"),
+                },
+                decision=Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=0.7, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={
+                    FieldName.PAYMENT_AMOUNT: [
+                        _candidate(FieldName.PAYMENT_AMOUNT, 1000),
+                        _candidate(FieldName.PAYMENT_AMOUNT, 1200),
+                    ]
+                },
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U1B", "R1B", result, pending_receipt=_pending_metadata("R1B"))
+            service.handle_postback("U1B", f"a=field&r=R1B&f={FieldName.PAYMENT_AMOUNT}")
+            invalid_messages = service.handle_text("U1B", "金額不明")
+            invalid_text = "\n".join(str(m.get("text", "")) for m in invalid_messages if isinstance(m, dict))
+            self.assertIn("金額は数字", invalid_text)
+            session = repo.get_active_session("U1B")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.state, "AWAIT_FIELD_CANDIDATE")
+
+            messages = service.handle_text("U1B", "1,250円")
+            joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
+            self.assertIn("金額を更新しました", joined)
+            session = repo.get_active_session("U1B")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.state, "AWAIT_CONFIRM")
+            self.assertEqual(session.payload.get("fields", {}).get(FieldName.PAYMENT_AMOUNT), 1250)
+            self.assertEqual(repo.get_receipt_fields("R1B"), {})
+
+    def test_candidate_wait_typed_free_text_action_starts_free_text(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            result = ExtractionResult(
+                document_id="doc-typed-free-text",
+                household_id=None,
+                document_type=DocumentType.PHARMACY,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "テスト薬局"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-02-20"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 1000),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 太郎"),
+                },
+                decision=Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=0.7, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={FieldName.PAYMENT_AMOUNT: [_candidate(FieldName.PAYMENT_AMOUNT, 1000)]},
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U1C", "R1C", result)
+            service.handle_postback("U1C", f"a=field&r=R1C&f={FieldName.PAYMENT_AMOUNT}")
+            messages = service.handle_text("U1C", "自分で入力する")
+            joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
+            self.assertIn("金額の新しい値", joined)
+            session = repo.get_active_session("U1C")
+            self.assertIsNotNone(session)
+            assert session is not None
+            session_fields = session.payload.get("fields", {})
+            self.assertEqual(session_fields.get(FieldName.PAYMENT_AMOUNT), 1000)
+            self.assertEqual(session.state, "AWAIT_FREE_TEXT")
+            self.assertEqual(session.awaiting_field, FieldName.PAYMENT_AMOUNT)
+
+    def test_candidate_wait_typed_candidate_number_picks_candidate(self) -> None:
+        year = datetime.now(timezone.utc).year
+        long_facility_name = "医療法人テスト会サンプル総合クリニック中央受付"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            result = ExtractionResult(
+                document_id="doc-typed-candidate-number",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "旧クリニック"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-02-20"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 1000),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 太郎"),
+                },
+                decision=Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=0.7, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={
+                    FieldName.PAYER_FACILITY_NAME: [
+                        _candidate(FieldName.PAYER_FACILITY_NAME, long_facility_name),
+                    ]
+                },
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U1E", "R1E", result, pending_receipt=_pending_metadata("R1E"))
+            messages = service.handle_postback("U1E", f"a=field&r=R1E&f={FieldName.PAYER_FACILITY_NAME}")
+            labels = _extract_quick_reply_labels(messages)
+            self.assertIn("候補1", labels)
+            service.handle_text("U1E", "候補1")
+            session = repo.get_active_session("U1E")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
+            self.assertEqual(fields.get(FieldName.PAYER_FACILITY_NAME), long_facility_name)
+            self.assertEqual(repo.get_receipt_fields("R1E"), {})
+
+    def test_candidate_wait_accepts_direct_full_date_input(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            result = ExtractionResult(
+                document_id="doc-direct-date",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "外来センター病院"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, "02-17"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 11860),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 太郎"),
+                },
+                decision=Decision(status=DecisionStatus.AUTO_ACCEPT, confidence=0.95, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={FieldName.PAYMENT_DATE: [_candidate(FieldName.PAYMENT_DATE, "02-17")]},
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U1D", "R1D", result, pending_receipt=_pending_metadata("R1D"))
+            session = repo.get_active_session("U1D")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.state, "AWAIT_FIELD_CANDIDATE")
+            messages = service.handle_text("U1D", f"{year}年2月18日")
+            joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
+            self.assertIn("日付を更新しました", joined)
+            session = repo.get_active_session("U1D")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
+            self.assertEqual(fields.get(FieldName.PAYMENT_DATE), f"{year}-02-18")
 
     def test_auto_accept_waits_user_confirmation(self) -> None:
         year = datetime.now(timezone.utc).year
@@ -96,13 +258,14 @@ class ConversationServiceTest(unittest.TestCase):
                 candidate_pool={},
                 ocr_lines=[],
             )
-            messages = service.handle_new_result("U2", "R2", result)
+            messages = service.handle_new_result("U2", "R2", result, pending_receipt=_pending_metadata("R2"))
             session = repo.get_active_session("U2")
             self.assertIsNotNone(session)
             self.assertEqual(session.state, "AWAIT_CONFIRM")
             total, count = repo.get_year_summary("U2", year)
-            self.assertEqual((total, count), (3500, 1))
-            self.assertEqual(repo.get_pending_count("U2"), 1)
+            self.assertEqual((total, count), (0, 0))
+            self.assertEqual(repo.get_pending_count("U2"), 0)
+            self.assertEqual(repo.get_receipt_fields("R2"), {})
             joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
             self.assertIn("内容を確認してください。", joined)
             self.assertIn(f"日付: {year}/01/01", joined)
@@ -112,7 +275,39 @@ class ConversationServiceTest(unittest.TestCase):
             confirmed_messages = service.handle_postback("U2", "a=ok&r=R2")
             self.assertIsNone(repo.get_active_session("U2"))
             self.assertEqual(repo.get_pending_count("U2"), 0)
+            total, count = repo.get_year_summary("U2", year)
+            self.assertEqual((total, count), (3500, 1))
             _assert_cumulative_message(confirmed_messages, expected_current_year_total=3500)
+
+    def test_receipt_is_not_duplicate_candidate_until_confirmed(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo)
+            result = ExtractionResult(
+                document_id="doc-pending",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "テスト医院"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-01-01"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 3500),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(FieldName.FAMILY_MEMBER_NAME, "山田 花子"),
+                },
+                decision=Decision(status=DecisionStatus.AUTO_ACCEPT, confidence=0.95, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={},
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U2B", "R2B", result, pending_receipt=_pending_metadata("R2B"))
+            self.assertEqual(repo.get_receipt_fields("R2B"), {})
+            self.assertEqual(repo.find_potential_duplicates("U2B", "sha-R2B", None, limit=3), [])
+
+            service.handle_postback("U2B", "a=ok&r=R2B")
+            duplicates = repo.find_potential_duplicates("U2B", "sha-R2B", None, limit=3)
+            self.assertEqual(len(duplicates), 1)
 
     def test_learning_hint_updates_family_member_name(self) -> None:
         year = datetime.now(timezone.utc).year
@@ -139,11 +334,17 @@ class ConversationServiceTest(unittest.TestCase):
                 ocr_lines=[],
             )
 
-            messages = service.handle_new_result("U3", "R3", result)
-            fields = repo.get_receipt_fields("R3")
+            messages = service.handle_new_result("U3", "R3", result, pending_receipt=_pending_metadata("R3"))
+            session = repo.get_active_session("U3")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
             self.assertEqual(fields.get(FieldName.FAMILY_MEMBER_NAME), "山田 花子")
+            self.assertEqual(repo.get_receipt_fields("R3"), {})
             joined = "\n".join(str(m.get("text", "")) for m in messages if isinstance(m, dict))
             self.assertIn("過去の訂正履歴を反映", joined)
+            service.handle_postback("U3", "a=ok&r=R3")
+            self.assertEqual(repo.get_receipt_fields("R3").get(FieldName.FAMILY_MEMBER_NAME), "山田 花子")
 
     def test_incomplete_payment_date_prompts_candidate_confirmation(self) -> None:
         year = datetime.now(timezone.utc).year
@@ -182,8 +383,12 @@ class ConversationServiceTest(unittest.TestCase):
             self.assertIn(f"{year}/02/17", labels)
 
             service.handle_postback("U4", f"a=pick&r=R4&f={FieldName.PAYMENT_DATE}&i=0")
-            fields = repo.get_receipt_fields("R4")
+            session = repo.get_active_session("U4")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
             self.assertEqual(fields.get(FieldName.PAYMENT_DATE), f"{year}-02-17")
+            self.assertEqual(repo.get_receipt_fields("R4"), {})
 
     def test_free_text_payment_date_without_year_prompts_year_candidates(self) -> None:
         year = datetime.now(timezone.utc).year
@@ -226,8 +431,12 @@ class ConversationServiceTest(unittest.TestCase):
             options = session.payload.get("candidates", {}).get(FieldName.PAYMENT_DATE, [])
             index = options.index(f"{year}-02-17")
             service.handle_postback("U4B", f"a=pick&r=R4B&f={FieldName.PAYMENT_DATE}&i={index}")
-            fields = repo.get_receipt_fields("R4B")
+            session = repo.get_active_session("U4B")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
             self.assertEqual(fields.get(FieldName.PAYMENT_DATE), f"{year}-02-17")
+            self.assertEqual(repo.get_receipt_fields("R4B"), {})
 
     def test_free_text_payment_date_invalid_format_requests_reinput(self) -> None:
         year = datetime.now(timezone.utc).year
@@ -313,9 +522,106 @@ class ConversationServiceTest(unittest.TestCase):
             self.assertIn("新しい家族を追加", labels)
 
             service.handle_postback("U5", f"a=pick&r=R5&f={FieldName.FAMILY_MEMBER_NAME}&i=0")
-            fields = repo.get_receipt_fields("R5")
+            session = repo.get_active_session("U5")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
             self.assertEqual(fields.get(FieldName.FAMILY_MEMBER_NAME), "山田 太郎")
+            self.assertEqual(repo.get_receipt_fields("R5"), {})
             members = repo.list_family_members("U5")
+            self.assertIn("山田 太朗", members[0]["aliases"])
+
+    def test_family_candidate_fallback_prioritizes_detected_name_match(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            repo.ensure_family_registration_started("U5B")
+            repo.upsert_family_member("U5B", "佐藤 一郎", [])
+            repo.upsert_family_member("U5B", "高橋 二郎", [])
+            repo.upsert_family_member("U5B", "鈴木 三郎", [])
+            repo.upsert_family_member("U5B", "山田 太郎", ["ヤマダ タロウ"])
+            repo.complete_family_registration("U5B")
+
+            result = ExtractionResult(
+                document_id="doc5b",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "テスト医院"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-02-20"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 4200),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(
+                        FieldName.FAMILY_MEMBER_NAME,
+                        "山田 太朗",
+                        source="family_registry_same_surname",
+                    ),
+                },
+                decision=Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=0.7, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={},
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U5B", "R5B", result)
+            session = repo.get_active_session("U5B")
+            self.assertIsNotNone(session)
+            assert session is not None
+            options = session.payload.get("candidates", {}).get(FieldName.FAMILY_MEMBER_NAME, [])
+            self.assertEqual(options[0], "山田 太郎")
+            self.assertNotIn("鈴木 三郎", options)
+
+            service.handle_postback("U5B", f"a=pick&r=R5B&f={FieldName.FAMILY_MEMBER_NAME}&i=0")
+            session = repo.get_active_session("U5B")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
+            self.assertEqual(fields.get(FieldName.FAMILY_MEMBER_NAME), "山田 太郎")
+            self.assertEqual(repo.get_receipt_fields("R5B"), {})
+            members = [item for item in repo.list_family_members("U5B") if item.get("canonical_name") == "山田 太郎"]
+            self.assertTrue(members)
+            self.assertIn("山田 太朗", members[0]["aliases"])
+
+    def test_direct_family_input_resolves_registered_alias(self) -> None:
+        year = datetime.now(timezone.utc).year
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = InboxRepository(str(Path(tmp) / "linebot.db"))
+            service = ConversationService(repo, session_ttl_minutes=60, max_candidate_options=3)
+            repo.ensure_family_registration_started("U5C")
+            repo.upsert_family_member("U5C", "山田 太郎", ["ヤマダ タロウ"])
+            repo.complete_family_registration("U5C")
+
+            result = ExtractionResult(
+                document_id="doc5c",
+                household_id=None,
+                document_type=DocumentType.CLINIC_OR_HOSPITAL,
+                template_match=TemplateMatch(matched=False, template_family_id=None, score=0.0),
+                fields={
+                    FieldName.PAYER_FACILITY_NAME: _candidate(FieldName.PAYER_FACILITY_NAME, "テスト医院"),
+                    FieldName.PAYMENT_DATE: _candidate(FieldName.PAYMENT_DATE, f"{year}-02-20"),
+                    FieldName.PAYMENT_AMOUNT: _candidate(FieldName.PAYMENT_AMOUNT, 4200),
+                    FieldName.FAMILY_MEMBER_NAME: _candidate(
+                        FieldName.FAMILY_MEMBER_NAME,
+                        "山田 太朗",
+                        source="family_registry_same_surname",
+                    ),
+                },
+                decision=Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=0.7, reasons=["test"]),
+                audit=AuditInfo(engine="mock", engine_version="1.0", pipeline_version="0.1.0"),
+                candidate_pool={},
+                ocr_lines=[],
+            )
+
+            service.handle_new_result("U5C", "R5C", result)
+            service.handle_text("U5C", "山田太郎")
+            session = repo.get_active_session("U5C")
+            self.assertIsNotNone(session)
+            assert session is not None
+            fields = session.payload.get("fields", {})
+            self.assertEqual(fields.get(FieldName.FAMILY_MEMBER_NAME), "山田 太郎")
+            self.assertEqual(repo.get_receipt_fields("R5C"), {})
+            members = repo.list_family_members("U5C")
             self.assertIn("山田 太朗", members[0]["aliases"])
 
     def test_add_family_flow_returns_to_original_review(self) -> None:
@@ -398,8 +704,12 @@ class ConversationServiceTest(unittest.TestCase):
             options = resumed_session.payload.get("candidates", {}).get(FieldName.FAMILY_MEMBER_NAME, [])
             index = options.index("佐藤 花子")
             service.handle_postback("U6", f"a=pick&r=R6&f={FieldName.FAMILY_MEMBER_NAME}&i={index}")
-            fields = repo.get_receipt_fields("R6")
+            resumed_session = repo.get_active_session("U6")
+            self.assertIsNotNone(resumed_session)
+            assert resumed_session is not None
+            fields = resumed_session.payload.get("fields", {})
             self.assertEqual(fields.get(FieldName.FAMILY_MEMBER_NAME), "佐藤 花子")
+            self.assertEqual(repo.get_receipt_fields("R6"), {})
 
             members = repo.list_family_members("U6")
             sato = [item for item in members if item.get("canonical_name") == "佐藤 花子"]
@@ -455,6 +765,14 @@ def _extract_quick_reply_labels(messages: list[dict[str, object]]) -> list[str]:
             if label:
                 labels.append(label)
     return labels
+
+
+def _pending_metadata(receipt_id: str) -> dict[str, str]:
+    return {
+        "line_message_id": f"message-{receipt_id}",
+        "image_path": f"s3://bucket/raw/{receipt_id}.jpg",
+        "image_sha256": f"sha-{receipt_id}",
+    }
 
 
 def _assert_cumulative_message(messages: list[dict[str, object]], expected_current_year_total: int) -> None:
