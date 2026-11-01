@@ -149,6 +149,18 @@ button:disabled { opacity: .5; cursor: default; }
 }
 .suggestion button { padding: 4px 10px; }
 
+.export-button { width: 100%; margin-top: 10px; }
+.export-summary { margin: 0; }
+.export-notes { margin: 0; padding-left: 18px; font-size: 13px; display: grid; gap: 4px; }
+.export-notes .warning { color: var(--warning); }
+.export-result { display: grid; gap: 8px; padding: 10px; background: var(--bg); border-radius: 8px; }
+.export-result p { margin: 0; }
+a.button {
+  display: block; text-align: center; text-decoration: none; border-radius: 8px; padding: 10px 14px;
+  background: var(--primary); color: var(--primary-text); font-weight: 600;
+}
+.export-help { font-size: 13px; }
+.export-help ol { padding-left: 18px; margin: 6px 0; }
 .receipt-image { display: grid; gap: 6px; }
 .receipt-image img { width: 100%; border-radius: 8px; border: 1px solid var(--border); }
 

@@ -148,6 +148,8 @@
     }
     setupStaticControls();
     await loadYear(defaultYear());
+    // LINE の「申告資料」コマンドから開いたときは、資料作成の画面を開く
+    if (new URLSearchParams(window.location.search).get("view") === "export") openExportDialog();
   }
 
   function defaultYear() {
@@ -205,6 +207,20 @@
     $("provider-suggestion-apply").addEventListener("click", () => {
       providerInput.value = $("provider-suggestion").dataset.name || providerInput.value;
       onProviderInput();
+    });
+    $("export-open").addEventListener("click", openExportDialog);
+    $("export-cancel").addEventListener("click", () => $("export-dialog").close());
+    $("export-checks").addEventListener("click", () => {
+      $("export-dialog").close();
+      switchTab("checks");
+    });
+    $("export-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      createExport();
+    });
+    $("export-external").addEventListener("click", () => {
+      const url = $("export-download").href;
+      if (url && url !== "#") liff.openWindow({ url, external: true });
     });
     $("rename-cancel").addEventListener("click", () => $("rename-dialog").close());
     $("rename-form").addEventListener("submit", (event) => {
@@ -634,6 +650,69 @@
     image.removeAttribute("src");
     message.textContent = "";
     button.disabled = false;
+  }
+
+  // ---------- 確定申告用の資料（医療費集計フォーム） ----------
+  const EXCLUDED_LABELS = {
+    unconfirmed: "未確定・保留の明細",
+    has_error: "要修正の項目がある明細",
+  };
+
+  async function openExportDialog() {
+    $("export-error").textContent = "";
+    $("export-result").hidden = true;
+    $("export-download").href = "#";
+    $("export-summary").hidden = true;
+    $("export-notes").replaceChildren();
+    $("export-title").textContent = `${state.year}年分の確定申告用の資料`;
+    $("export-status").textContent = "内容を確認しています…";
+    $("export-create").disabled = true;
+    $("export-dialog").showModal();
+    try {
+      renderExportPreview(await api("GET", `/export?year=${state.year}`));
+    } catch (error) {
+      $("export-status").textContent = "";
+      if (error.status !== 401) $("export-error").textContent = error.message;
+    }
+  }
+
+  function renderExportPreview(preview) {
+    $("export-status").textContent = "";
+    $("export-summary").hidden = false;
+    $("export-count").textContent = `${preview.included_count}件`;
+    $("export-total").textContent = formatYen(preview.total_amount_yen);
+    $("export-reimbursed").textContent = formatYen(preview.total_reimbursed_yen);
+    $("export-net").textContent = formatYen(preview.net_amount_yen);
+    const notes = [];
+    for (const [reason, count] of Object.entries(preview.excluded_counts || {})) {
+      notes.push(el("li", { className: "warning", text: `${EXCLUDED_LABELS[reason] || reason} ${count}件は資料に載せていません。チェックタブで確認できます。` }));
+    }
+    for (const notice of preview.notices || []) {
+      const count = (notice.entry_ids || []).length;
+      notes.push(el("li", { className: "warning", text: count ? `${notice.message}（${count}件）` : notice.message }));
+    }
+    if (!notes.length) notes.push(el("li", { text: "この年の明細はすべて資料に載ります。" }));
+    $("export-notes").replaceChildren(...notes);
+    $("export-create").disabled = preview.included_count === 0;
+    if (preview.included_count === 0) $("export-error").textContent = "資料に載せられる明細がありません。";
+  }
+
+  async function createExport() {
+    $("export-error").textContent = "";
+    $("export-create").disabled = true;
+    $("export-status").textContent = "資料を作成しています…";
+    try {
+      const result = await api("POST", "/export", { year: state.year });
+      renderExportPreview(result);
+      $("export-download").href = result.url;
+      $("export-download").setAttribute("download", result.filename);
+      $("export-result").hidden = false;
+    } catch (error) {
+      $("export-status").textContent = "";
+      if (error.status !== 401) $("export-error").textContent = error.message;
+    } finally {
+      $("export-create").disabled = false;
+    }
   }
 
   // ---------- 支払先の名前をまとめて直す ----------

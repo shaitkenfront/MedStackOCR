@@ -5,14 +5,16 @@ OCR 用の重い依存（Document AI など）は読み込まず、DynamoDB と 
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any
+from uuid import uuid4
 from urllib.parse import urlparse
 
 from inbox.dynamo_repository import DynamoInboxRepository
 from inbox.ocr_archive import archive_path_for
-from ledger.api import ApiRequest, LedgerApi
+from ledger.api import EXPORT_URL_EXPIRES_SECONDS, ApiRequest, LedgerApi
 from ledger.auth import LineIdTokenVerifier
 from ledger.service import LedgerService
 
@@ -93,12 +95,42 @@ def build_api_from_env(env: Any, *, dynamodb_resource: Any | None = None, s3_cli
             ExpiresIn=expires_in,
         )
 
+    export_prefix = str(env.get("EXPORT_PREFIX") or "exports").strip("/")
+
+    def upload_export(user_id: str, filename: str, content: bytes) -> str:
+        """申告用の資料を一時的に保存し、期限付きのダウンロード URL を返す（保存先はライフサイクルで1日後に削除）。"""
+        if s3_client is None or not bucket:
+            raise RuntimeError("receipt bucket is not configured")
+        owner = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]
+        key = f"{export_prefix}/{owner}/{uuid4()}/{filename}"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=content,
+            ContentType=XLSX_CONTENT_TYPE,
+        )
+        return s3_client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+                "ResponseContentType": XLSX_CONTENT_TYPE,
+                "ResponseCacheControl": "private, no-store",
+            },
+            ExpiresIn=EXPORT_URL_EXPIRES_SECONDS,
+        )
+
     return LedgerApi(
         LedgerService(repository),
         verifier,
         image_deleter=delete_image,
         image_url_signer=sign_image_url,
+        export_uploader=upload_export,
     )
+
+
+XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 def _is_not_found(exc: Exception) -> bool:

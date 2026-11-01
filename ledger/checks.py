@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
@@ -22,6 +23,11 @@ CODE_UNKNOWN_FAMILY = "unknown_family_member"
 CODE_YEAR_DIFFERS = "year_differs_from_registration"
 CODE_PROVIDER_VARIANT = "provider_name_variant"
 CODE_PROVIDER_SUSPICIOUS = "provider_name_suspicious"
+CODE_FORM_TEXT_TOO_LONG = "form_text_too_long"
+
+# 国税庁「医療費集計フォーム」の文字数制限（ledger.tax_form と同じ値）
+FORM_MAX_FAMILY_NAME_LENGTH = 10
+FORM_MAX_PROVIDER_NAME_LENGTH = 20
 
 
 @dataclass(slots=True)
@@ -84,6 +90,17 @@ def _check_entry(entry: LedgerEntry, known_names: set[str]) -> list[LedgerIssue]
         add(CODE_MISSING_FAMILY, SEVERITY_ERROR, "医療を受けた人が入っていません。")
     elif known_names and _normalize_name(entry.family_member_name) not in known_names:
         add(CODE_UNKNOWN_FAMILY, SEVERITY_WARNING, "家族として登録されていない名前です。表記を確認してください。")
+
+    for value, limit, label in (
+        (entry.provider_name, FORM_MAX_PROVIDER_NAME_LENGTH, "支払先の名前"),
+        (entry.family_member_name, FORM_MAX_FAMILY_NAME_LENGTH, "医療を受けた人の名前"),
+    ):
+        if value and len(_form_text(value)) > limit:
+            add(
+                CODE_FORM_TEXT_TOO_LONG,
+                SEVERITY_WARNING,
+                f"{label}が申告用フォームの上限（{limit}文字）を超えています。そのままだと先頭の{limit}文字だけが書き出されます。",
+            )
 
     if entry.amount_yen is None or entry.amount_yen <= 0:
         add(CODE_MISSING_AMOUNT, SEVERITY_ERROR, "支払った金額が入っていません。")
@@ -176,6 +193,10 @@ def _known_family_names(family_members: Iterable[dict[str, Any]]) -> set[str]:
             if normalized:
                 names.add(normalized)
     return names
+
+
+def _form_text(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
 
 
 def _normalize_name(value: Any) -> str:

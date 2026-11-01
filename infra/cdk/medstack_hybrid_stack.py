@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from aws_cdk import (
     CfnOutput,
+    CustomResource,
     Duration,
     RemovalPolicy,
     Stack,
@@ -19,6 +21,7 @@ from aws_cdk import (
     aws_s3_deployment as s3deploy,
     aws_secretsmanager as secretsmanager,
     aws_sqs as sqs,
+    custom_resources as cr,
 )
 from constructs import Construct
 
@@ -84,7 +87,13 @@ class MedstackHybridStack(Stack):
                     prefix=f"{receipt_prefix}/",
                     # 医療費控除の領収書は申告期限から5年間の保存が必要なため、余裕を見て6年保存する
                     expiration=Duration.days(365 * 6 + 2),
-                )
+                ),
+                # 申告用資料（医療費集計フォーム）の一時保存。ダウンロード用の URL は10分で切れ、ファイルも1日で消す
+                s3.LifecycleRule(
+                    id="ExpireTaxFormExports",
+                    prefix="exports/",
+                    expiration=Duration.days(1),
+                ),
             ],
             removal_policy=RemovalPolicy.RETAIN,
         )
@@ -291,6 +300,7 @@ class MedstackHybridStack(Stack):
                 "DOC_AI_LOCATION": docai_location,
                 "DOC_AI_PROCESSOR_ID": docai_processor_id,
                 "TEMPLATE_STORE_PATH": "/tmp/data/templates",
+                "LIFF_ID": liff_id,
                 "OCR_GUARD_ENABLED": "true",
                 "OCR_GUARD_USER_PER_MINUTE": "3",
                 "OCR_GUARD_USER_PER_DAY": "40",
@@ -354,6 +364,7 @@ class MedstackHybridStack(Stack):
         # 領収書画像の閲覧用 URL 発行（存在確認に ListBucket も必要）と、明細削除時の画像削除
         receipt_bucket.grant_read(ledger_api_fn)
         receipt_bucket.grant_delete(ledger_api_fn)
+        receipt_bucket.grant_put(ledger_api_fn, "exports/*")
 
         line_webhook_api = apigwv2.HttpApi(
             self,
@@ -469,6 +480,39 @@ class MedstackHybridStack(Stack):
             distribution=liff_distribution,
             distribution_paths=["/*"],
         )
+
+        # --- LINE のリッチメニュー（明細を見る / 今年の医療費 / 申告資料 / 使い方） ---
+        # チャネルアクセストークンは手元に出さず、デプロイ時に Lambda が Secrets Manager から読んで登録する
+        if app_secret is not None and liff_id:
+            rich_menu_dir = Path(__file__).resolve().parent / "rich_menu"
+            rich_menu_fn = lambda_.Function(
+                self,
+                "LineRichMenuFunction",
+                function_name=f"{prefix}-line-rich-menu",
+                runtime=lambda_.Runtime.PYTHON_3_12,
+                handler="handler.on_event",
+                code=lambda_.Code.from_asset(str(rich_menu_dir), exclude=["make_image.py", "__pycache__"]),
+                timeout=Duration.seconds(90),
+                memory_size=256,
+            )
+            app_secret.grant_read(rich_menu_fn)
+            rich_menu_provider = cr.Provider(self, "LineRichMenuProvider", on_event_handler=rich_menu_fn)
+            # 画像・メニューの定義・LIFF ID が変わったときだけ登録し直す
+            rich_menu_version = hashlib.sha256(
+                (rich_menu_dir / "rich_menu.png").read_bytes()
+                + (rich_menu_dir / "handler.py").read_bytes()
+                + liff_id.encode("utf-8")
+            ).hexdigest()[:12]
+            CustomResource(
+                self,
+                "LineRichMenu",
+                service_token=rich_menu_provider.service_token,
+                properties={
+                    "SecretId": app_secrets_name,
+                    "LiffId": liff_id,
+                    "Version": rich_menu_version,
+                },
+            )
 
         CfnOutput(self, "LiffEndpointUrl", value=f"https://{liff_distribution.distribution_domain_name}/")
         CfnOutput(self, "LineWebhookUrl", value=f"{line_webhook_api.api_endpoint}{line_webhook_path}")

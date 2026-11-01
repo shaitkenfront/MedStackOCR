@@ -105,7 +105,7 @@ class LineEventWorker:
 
         timeout_sec = float(self.line_conf.get("timeout_sec", 10))
         self.repository = create_inbox_repository(config)
-        self.aggregate_service = AggregateService(self.repository)
+        self.aggregate_service = AggregateService(self.repository, liff_id=os.getenv("LIFF_ID", ""))
         self.conversation_service = ConversationService(
             repository=self.repository,
             session_ttl_minutes=int(self.inbox_conf.get("session_ttl_minutes", 60)),

@@ -116,3 +116,15 @@ LIFF アプリの作成にはエンドポイント URL が必要なため、初�
    LIFF ID はデプロイ時に `config.json` として画面に配置されます。
 4. `https://liff.line.me/<LIFF ID>` をリッチメニューなどに設定すると、LINE から明細画面を開けます。
    `?year=2025` を付けるとその年を開きます（付けない場合、1〜3月は前年、それ以外は今年）。
+
+## 7. 確定申告用の資料とリッチメニュー
+
+- `POST /api/export` で国税庁「医療費集計フォーム」を作り、領収書バケットの `exports/` に一時保存して
+  10分有効のダウンロード URL を返します。`exports/` はライフサイクルで1日後に削除されます。
+- `liff_id` と `app_secrets_name` が設定されていると、デプロイ時にカスタムリソース（`rich_menu/handler.py`）が
+  LINE のリッチメニューを登録し、全利用者の既定メニューにします。
+  - チャネルアクセストークンは Lambda が Secrets Manager から読みます（手元には出しません）。
+  - このスタックが作ったメニュー（名前が `medstackocr-main` で始まるもの）だけを入れ替え・削除します。
+  - API で既定メニューを設定すると、LINE Official Account Manager で設定したメニューより優先されます。
+  - メニュー画像を変えるときは `python infra/cdk/rich_menu/make_image.py` で `rich_menu.png` を作り直します
+    （ボタンの並びは `handler.py` の `menu_areas` と合わせること）。画像か定義が変わったときだけ登録し直します。

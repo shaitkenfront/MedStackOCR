@@ -23,6 +23,7 @@ from ledger.models import (
     STATUS_CONFIRMED,
     LedgerEntry,
 )
+from ledger.tax_form import FormNotice, plan_form_rows, render_form
 from ledger.validation import LedgerValidationError, validate_entry_input
 
 # 明細を直したとき、OCR の項目値にも反映して再確定時に元へ戻らないようにする
@@ -95,6 +96,47 @@ class LedgerCheckReport:
         }
 
 
+@dataclass(slots=True)
+class TaxFormExport:
+    """申告用の「医療費集計フォーム」の内容。content は作成したときだけ入る。"""
+
+    year: int
+    included_count: int
+    row_count: int
+    total_amount_yen: int
+    total_reimbursed_yen: int
+    aggregated: bool
+    excluded: list[dict[str, Any]]
+    notices: list[FormNotice]
+    content: bytes | None = None
+
+    @property
+    def filename(self) -> str:
+        return f"iryouhi_shukei_{self.year}.xlsx"
+
+    def to_dict(self) -> dict[str, Any]:
+        excluded_counts: dict[str, int] = {}
+        for item in self.excluded:
+            excluded_counts[item["reason"]] = excluded_counts.get(item["reason"], 0) + 1
+        return {
+            "year": self.year,
+            "included_count": self.included_count,
+            "row_count": self.row_count,
+            "total_amount_yen": self.total_amount_yen,
+            "total_reimbursed_yen": self.total_reimbursed_yen,
+            "net_amount_yen": self.total_amount_yen - self.total_reimbursed_yen,
+            "aggregated": self.aggregated,
+            "excluded": self.excluded,
+            "excluded_counts": excluded_counts,
+            "notices": [notice.to_dict() for notice in self.notices],
+            "filename": self.filename,
+        }
+
+
+EXCLUDED_UNCONFIRMED = "unconfirmed"
+EXCLUDED_HAS_ERROR = "has_error"
+
+
 class LedgerService:
     def __init__(self, repository: InboxRepositoryProtocol) -> None:
         self.repository = repository
@@ -161,6 +203,35 @@ class LedgerService:
                 family_members,
                 self.repository.list_provider_distinct_pair_keys(line_user_id),
             ),
+        )
+
+    # --- 申告用資料（国税庁「医療費集計フォーム」） ---
+
+    def prepare_tax_form(self, line_user_id: str, year: int, *, render: bool = False) -> TaxFormExport:
+        """対象年の、確定済みで要修正の問題がない明細をフォームにする。含めなかった明細は理由を返す。"""
+        report = self.check(line_user_id, year)
+        entries = self.list_entries(line_user_id, year)
+        error_ids = {issue.entry_id for issue in report.issues if issue.severity == "error"}
+        included: list[LedgerEntry] = []
+        excluded: list[dict[str, Any]] = []
+        for entry in entries:
+            if entry.status != STATUS_CONFIRMED:
+                excluded.append({"entry_id": entry.entry_id, "reason": EXCLUDED_UNCONFIRMED})
+            elif entry.entry_id in error_ids:
+                excluded.append({"entry_id": entry.entry_id, "reason": EXCLUDED_HAS_ERROR})
+            else:
+                included.append(entry)
+        plan = plan_form_rows(included)
+        return TaxFormExport(
+            year=year,
+            included_count=len(included),
+            row_count=len(plan.rows),
+            total_amount_yen=plan.total_amount_yen,
+            total_reimbursed_yen=plan.total_reimbursed_yen,
+            aggregated=plan.aggregated,
+            excluded=excluded,
+            notices=plan.notices,
+            content=render_form(plan.rows) if render and plan.rows else None,
         )
 
     # --- 支払先の名寄せ ---

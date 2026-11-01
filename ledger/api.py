@@ -38,6 +38,9 @@ IMAGE_URL_EXPIRES_SECONDS = 300
 ImageDeleter = Callable[[str], None]
 # 画像パスから、期限付きで閲覧できる URL を作る。画像が残っていなければ None。
 ImageUrlSigner = Callable[[str, int], "str | None"]
+# (利用者, ファイル名, 内容) を保存し、期限付きでダウンロードできる URL を返す。
+ExportUploader = Callable[[str, str, bytes], str]
+EXPORT_URL_EXPIRES_SECONDS = 600
 
 
 @dataclass(slots=True)
@@ -100,12 +103,14 @@ class LedgerApi:
         *,
         image_deleter: ImageDeleter | None = None,
         image_url_signer: ImageUrlSigner | None = None,
+        export_uploader: ExportUploader | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(JST),
     ) -> None:
         self.service = service
         self.verifier = verifier
         self.image_deleter = image_deleter
         self.image_url_signer = image_url_signer
+        self.export_uploader = export_uploader
         self._now = now
 
     def handle(self, request: ApiRequest) -> ApiResponse:
@@ -136,6 +141,11 @@ class LedgerApi:
             self._require_method(method, {"GET"})
             report = self.service.check(user_id, self._year(request))
             return ApiResponse(200, report.to_dict())
+        if path == "/export":
+            self._require_method(method, {"GET", "POST"})
+            if method == "GET":
+                return ApiResponse(200, self.service.prepare_tax_form(user_id, self._year(request)).to_dict())
+            return self._create_export(user_id, self._json_body(request))
         if path == "/providers":
             self._require_method(method, {"GET"})
             return ApiResponse(200, self.service.provider_overview(user_id, self._year(request)))
@@ -185,6 +195,18 @@ class LedgerApi:
                 "provider_names": self.service.known_provider_names(user_id),
             },
         )
+
+    def _create_export(self, user_id: str, body: dict[str, Any]) -> ApiResponse:
+        year = self._parse_year(body.get("year"))
+        export = self.service.prepare_tax_form(user_id, year, render=True)
+        result = export.to_dict()
+        if export.content is None:
+            raise _HttpError(400, "nothing_to_export", "申告用の資料に載せられる明細がありません。", {"export": result})
+        if self.export_uploader is None:
+            raise _HttpError(503, "export_unavailable", "資料の作成ができません。時間をおいて再度お試しください。")
+        result["url"] = self.export_uploader(user_id, export.filename, export.content)
+        result["expires_in"] = EXPORT_URL_EXPIRES_SECONDS
+        return ApiResponse(201, result)
 
     def _rename_providers(self, user_id: str, body: dict[str, Any]) -> ApiResponse:
         try:
@@ -285,7 +307,10 @@ class LedgerApi:
             raise _HttpError(405, "method_not_allowed", "この操作はできません。")
 
     def _year(self, request: ApiRequest) -> int:
-        raw = str(request.query.get("year") or "").strip()
+        return self._parse_year(request.query.get("year"))
+
+    def _parse_year(self, value: Any) -> int:
+        raw = str(value or "").strip()
         if not raw:
             return self._now().year
         if not raw.isdigit() or not (MIN_YEAR <= int(raw) <= MAX_YEAR):

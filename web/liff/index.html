@@ -33,6 +33,7 @@
         <div><dt>未確定</dt><dd id="summary-unconfirmed">0件</dd></div>
       </dl>
       <p class="summary-note">医療費控除の対象になるのは、差引額から10万円（総所得金額等が200万円未満の人はその5%）を引いた額です。</p>
+      <button type="button" class="primary export-button" id="export-open">確定申告用の資料（Excel）を作る</button>
     </section>
 
     <nav class="tabs" id="tabs" hidden role="tablist">
@@ -155,6 +156,44 @@
       </div>
     </form>
   </dialog>
+  <dialog id="export-dialog" aria-labelledby="export-title">
+    <form id="export-form" method="dialog" novalidate>
+      <h2 id="export-title">確定申告用の資料</h2>
+      <p class="dialog-hint">国税庁の「医療費集計フォーム」（Excel）に、この年の明細を書き込みます。確定申告書等作成コーナーで読み込めます。</p>
+      <p class="status" id="export-status" role="status"></p>
+      <dl class="summary-grid export-summary" id="export-summary" hidden>
+        <div><dt>資料に載せる明細</dt><dd id="export-count"></dd></div>
+        <div><dt>支払った医療費</dt><dd id="export-total"></dd></div>
+        <div><dt>補填される金額</dt><dd id="export-reimbursed"></dd></div>
+        <div><dt>差引額</dt><dd id="export-net"></dd></div>
+      </dl>
+      <ul class="export-notes" id="export-notes"></ul>
+      <div class="export-result" id="export-result" hidden>
+        <p>資料を作成しました。リンクの有効期限は10分です。</p>
+        <a class="button primary" id="export-download" href="#" download>ダウンロード</a>
+        <button type="button" id="export-external">ブラウザで開いてダウンロード</button>
+        <p class="field-help">LINEの画面からダウンロードできないときは、「ブラウザで開いてダウンロード」を押してください。</p>
+      </div>
+      <details class="export-help">
+        <summary>作成コーナーでの読み込み方</summary>
+        <ol>
+          <li>確定申告書等作成コーナーの「控除の入力」で「医療費控除」を選ぶ</li>
+          <li>「医療費控除」を選んで「次へ」を押す</li>
+          <li>「医療費集計フォームを利用する」を選び、「集計フォーム読込画面へ」を押す</li>
+          <li>ダウンロードしたファイルを選び、「選択したファイルを読み込む」を押す</li>
+        </ol>
+        <p class="field-help">セルフメディケーション税制を使う場合は、このフォームは使えません。読み込んだあとは、内容が正しく反映されているか必ず確認してください。</p>
+      </details>
+      <p class="form-error" id="export-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" id="export-checks">チェックを見る</button>
+        <span class="spacer"></span>
+        <button type="button" id="export-cancel">閉じる</button>
+        <button type="submit" class="primary" id="export-create">Excelファイルを作成</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="rename-dialog" aria-labelledby="rename-title">
     <form id="rename-form" method="dialog" novalidate>
       <h2 id="rename-title">支払先の名前をまとめて直す</h2>
