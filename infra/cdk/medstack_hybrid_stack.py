@@ -82,7 +82,8 @@ class MedstackHybridStack(Stack):
                 s3.LifecycleRule(
                     id="ExpireRawImages",
                     prefix=f"{receipt_prefix}/",
-                    expiration=Duration.days(90),
+                    # 医療費控除の領収書は申告期限から5年間の保存が必要なため、余裕を見て6年保存する
+                    expiration=Duration.days(365 * 6 + 2),
                 )
             ],
             removal_policy=RemovalPolicy.RETAIN,
@@ -337,6 +338,7 @@ class MedstackHybridStack(Stack):
                 "DDB_SESSIONS_TABLE": sessions_table.table_name,
                 "DDB_AGGREGATE_TABLE": aggregate_entries_table.table_name,
                 "DDB_FAMILY_TABLE": family_registry_table.table_name,
+                "DDB_LEARNING_TABLE": learning_rules_table.table_name,
                 "RECEIPT_BUCKET": receipt_bucket.bucket_name,
                 "LINE_LOGIN_CHANNEL_ID": line_login_channel_id,
             },
@@ -347,6 +349,10 @@ class MedstackHybridStack(Stack):
         sessions_table.grant_read_write_data(ledger_api_fn)
         aggregate_entries_table.grant_read_write_data(ledger_api_fn)
         family_registry_table.grant_read_data(ledger_api_fn)
+        # 支払先の名寄せ（「別の支払先」の記録と、次回 OCR 用の名前の対応表）を学習ルールテーブルに保存する
+        learning_rules_table.grant_read_write_data(ledger_api_fn)
+        # 領収書画像の閲覧用 URL 発行（存在確認に ListBucket も必要）と、明細削除時の画像削除
+        receipt_bucket.grant_read(ledger_api_fn)
         receipt_bucket.grant_delete(ledger_api_fn)
 
         line_webhook_api = apigwv2.HttpApi(

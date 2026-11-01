@@ -23,9 +23,13 @@
     summary: null,
     issues: [],
     readyForExport: true,
+    providers: [],
+    providerGroups: [],
     tab: "entries",
     memberFilter: "",
+    providerFilter: "",
     issuesOnly: false,
+    focusGroupId: null,
     editing: null, // { entry, initial } 新規追加なら entry は null
   };
 
@@ -159,14 +163,17 @@
     $("app").setAttribute("aria-busy", "true");
     setStatus("読み込み中です…");
     try {
-      const [list, checks] = await Promise.all([
+      const [list, checks, providers] = await Promise.all([
         api("GET", `/entries?year=${year}`),
         api("GET", `/checks?year=${year}`),
+        api("GET", `/providers?year=${year}`),
       ]);
       state.entries = list.entries;
       state.summary = list.summary;
       state.issues = checks.issues;
       state.readyForExport = checks.ready_for_export;
+      state.providers = providers.providers;
+      state.providerGroups = providers.groups;
       setStatus("");
       render();
     } catch (error) {
@@ -181,6 +188,19 @@
     $("year-select").addEventListener("change", (event) => loadYear(Number(event.target.value)));
     $("tab-entries").addEventListener("click", () => switchTab("entries"));
     $("tab-checks").addEventListener("click", () => switchTab("checks"));
+    $("tab-providers").addEventListener("click", () => switchTab("providers"));
+    $("provider-filter-clear").addEventListener("click", () => {
+      state.providerFilter = "";
+      renderEntries();
+    });
+    $("receipt-image-button").addEventListener("click", showReceiptImage);
+    const providerInput = $("entry-form").elements.provider_name;
+    providerInput.addEventListener("input", updateProviderSuggestion);
+    providerInput.addEventListener("change", updateProviderSuggestion);
+    $("provider-suggestion-apply").addEventListener("click", () => {
+      providerInput.value = $("provider-suggestion").dataset.name || providerInput.value;
+      updateProviderSuggestion();
+    });
     $("member-filter").addEventListener("change", (event) => {
       state.memberFilter = event.target.value;
       renderEntries();
@@ -205,6 +225,11 @@
     for (const name of state.meta.family_members) {
       datalist.append(el("option", { value: name }));
     }
+    renderProviderOptions();
+  }
+
+  function renderProviderOptions() {
+    $("provider-options").replaceChildren(...(state.meta.provider_names || []).map((name) => el("option", { value: name })));
   }
 
   function renderYearOptions() {
@@ -226,6 +251,7 @@
     renderMemberFilter();
     renderEntries();
     renderChecks();
+    renderProviders();
     switchTab(state.tab);
   }
 
@@ -261,10 +287,13 @@
     const byEntry = issuesByEntry();
     const visible = state.entries.filter((entry) => {
       if (state.memberFilter && entry.family_member_name !== state.memberFilter) return false;
+      if (state.providerFilter && entry.provider_name !== state.providerFilter) return false;
       if (state.issuesOnly && !byEntry.has(entry.entry_id)) return false;
       return true;
     });
     $("entry-list").replaceChildren(...visible.map((entry) => renderEntry(entry, byEntry.get(entry.entry_id) || [])));
+    $("provider-filter-chip").hidden = !state.providerFilter;
+    $("provider-filter-label").textContent = `支払先: ${state.providerFilter}`;
     $("entries-empty").hidden = visible.length > 0;
     $("entries-empty").textContent = state.entries.length ? "条件に合う明細はありません。" : "この年の明細はまだありません。";
   }
@@ -321,6 +350,9 @@
       ...state.issues.map((issue) => {
         const entry = entryById.get(issue.entry_id);
         const actions = [];
+        if (issue.group_id) {
+          actions.push(el("button", { type: "button", text: "支払先タブで確認", onclick: () => openProviderGroup(issue.group_id) }));
+        }
         if (entry) actions.push(el("button", { type: "button", text: "この明細を開く", onclick: () => openDialog(entry) }));
         for (const relatedId of issue.related_entry_ids || []) {
           const related = entryById.get(relatedId);
@@ -345,11 +377,236 @@
 
   function switchTab(tab) {
     state.tab = tab;
-    const isEntries = tab === "entries";
-    $("tab-entries").setAttribute("aria-selected", String(isEntries));
-    $("tab-checks").setAttribute("aria-selected", String(!isEntries));
-    $("panel-entries").hidden = !isEntries;
-    $("panel-checks").hidden = isEntries;
+    for (const name of ["entries", "checks", "providers"]) {
+      $(`tab-${name}`).setAttribute("aria-selected", String(name === tab));
+      $(`panel-${name}`).hidden = name !== tab;
+    }
+  }
+
+  // ---------- 支払先（表記ゆれ・読み取りミス） ----------
+  function renderProviders() {
+    const groups = state.providerGroups;
+    const badge = $("providers-badge");
+    badge.hidden = groups.length === 0;
+    badge.textContent = String(groups.length);
+    $("groups-lead").textContent = groups.length
+      ? "同じ支払先なら、正しい名前を選んでそろえてください。そろえた名前は、次回からLINEで読み取ったときにも使われます。"
+      : "表記ゆれの候補はありません。";
+    $("group-list").replaceChildren(...groups.map(renderGroup));
+    $("provider-list").replaceChildren(
+      ...state.providers.map((provider) =>
+        el(
+          "li",
+          {},
+          el(
+            "button",
+            {
+              type: "button",
+              className: `provider-row${provider.suspicious_reason ? " suspicious" : ""}`,
+              onclick: () => {
+                state.providerFilter = provider.name;
+                renderEntries();
+                switchTab("entries");
+              },
+            },
+            [
+              el("span", { className: "variant-name", text: provider.name }),
+              el("span", { className: "entry-amount", text: formatYen(provider.total_amount_yen) }),
+              el("span", {
+                className: "variant-stat",
+                text: `${provider.count}件${provider.suspicious_reason ? `　⚠ ${provider.suspicious_reason}` : ""}`,
+              }),
+            ]
+          )
+        )
+      )
+    );
+    if (state.focusGroupId) {
+      const target = document.getElementById(`group-${state.focusGroupId}`);
+      state.focusGroupId = null;
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
+  function renderGroup(group) {
+    const radioName = `target-${group.group_id}`;
+    const rows = group.names.map((stat, index) =>
+      el("div", { className: "variant-row" }, [
+        el("input", {
+          type: "radio",
+          name: radioName,
+          value: stat.name,
+          id: `${radioName}-${index}`,
+          checked: stat.name === group.suggested_name,
+        }),
+        el("label", { className: "variant-name", for: `${radioName}-${index}`, text: stat.name }),
+        el("label", { className: "variant-distinct" }, [
+          el("input", { type: "checkbox", "data-distinct": stat.name }),
+          "別の支払先",
+        ]),
+        el("span", {
+          className: "variant-stat",
+          text: `${stat.count}件　${formatYen(stat.total_amount_yen)}${stat.suspicious_reason ? `　⚠ ${stat.suspicious_reason}` : ""}`,
+        }),
+      ])
+    );
+    const customInput = el("input", { type: "text", className: "custom-name", maxlength: 100, placeholder: "正しい名前を入力", hidden: true });
+    const customRadio = el("input", { type: "radio", name: radioName, value: "", id: `${radioName}-custom` });
+    customRadio.addEventListener("change", () => {
+      customInput.hidden = false;
+      customInput.focus();
+    });
+    const customRow = el("div", { className: "variant-row" }, [
+      customRadio,
+      el("label", { className: "variant-name", for: `${radioName}-custom`, text: "別の名前にする" }),
+      customInput,
+    ]);
+    const message = el("p", { className: "form-error", role: "alert" });
+    const fieldset = el("fieldset", { className: "group-card", id: `group-${group.group_id}` }, [
+      el("legend", { text: "同じ支払先ですか？" }),
+      ...rows,
+      customRow,
+      message,
+    ]);
+    const actions = el("div", { className: "group-actions" }, [
+      el("button", { type: "button", className: "primary", text: "選んだ名前にそろえる", onclick: () => unifyGroup(group, fieldset, customInput, message) }),
+      el("button", { type: "button", text: "すべて別の支払先", onclick: () => markGroupDistinct(group, message) }),
+    ]);
+    fieldset.append(actions);
+    return fieldset;
+  }
+
+  async function unifyGroup(group, fieldset, customInput, message) {
+    message.textContent = "";
+    const selected = fieldset.querySelector(`input[type="radio"]:checked`);
+    const target = selected && selected.value ? selected.value : customInput.value.trim();
+    if (!target) {
+      message.textContent = "そろえる名前を選ぶか入力してください。";
+      return;
+    }
+    const distinct = [...fieldset.querySelectorAll("input[data-distinct]:checked")]
+      .map((input) => input.dataset.distinct)
+      .filter((name) => name !== target);
+    const fromNames = group.names.map((stat) => stat.name).filter((name) => name !== target && !distinct.includes(name));
+    if (!fromNames.length && !distinct.length) {
+      message.textContent = "変更する名前がありません。";
+      return;
+    }
+    const confirmText = fromNames.length
+      ? `「${fromNames.join("」「")}」の明細（ほかの年も含む）を「${target}」に変更します。次回からLINEで読み取った同じ名前も自動でそろえます。よろしいですか？`
+      : "チェックした名前を別の支払先として記録します。よろしいですか？";
+    if (!window.confirm(confirmText)) return;
+    try {
+      if (fromNames.length) await api("POST", "/providers/rename", { from_names: fromNames, to_name: target });
+      if (distinct.length) await api("POST", "/providers/distinct", { names: [target, ...distinct] });
+      await refreshAfterChange();
+    } catch (error) {
+      if (error.status !== 401) message.textContent = errorText(error);
+    }
+  }
+
+  async function markGroupDistinct(group, message) {
+    message.textContent = "";
+    if (!window.confirm("これらはすべて別の支払先として記録し、今後は候補に出しません。よろしいですか？")) return;
+    try {
+      await api("POST", "/providers/distinct", { names: group.names.map((stat) => stat.name) });
+      await refreshAfterChange();
+    } catch (error) {
+      if (error.status !== 401) message.textContent = errorText(error);
+    }
+  }
+
+  function openProviderGroup(groupId) {
+    state.focusGroupId = groupId;
+    switchTab("providers");
+    renderProviders();
+  }
+
+  function errorText(error) {
+    const fields = (error.body && error.body.details && error.body.details.fields) || {};
+    const first = Object.values(fields)[0];
+    return first || error.message;
+  }
+
+  // 入力中の支払先が既存の名前と似ていたら、そろえるよう提案する（判定はサーバーと同じ考え方の簡易版）
+  const CORPORATE_WORDS = [
+    "社会医療法人社団", "社会医療法人財団", "社会医療法人", "医療法人社団", "医療法人財団", "医療法人",
+    "一般社団法人", "一般財団法人", "公益社団法人", "公益財団法人", "社会福祉法人", "独立行政法人",
+    "株式会社", "有限会社", "合同会社", "(株)", "(有)", "(医)",
+  ];
+  const CONFUSABLES = { "口": "ロ", "力": "カ", "工": "エ", "一": "ー", "―": "ー", "‐": "ー", "-": "ー", "卜": "ト", "二": "ニ", "八": "ハ", "夕": "タ" };
+
+  function providerKey(name) {
+    let text = String(name || "").normalize("NFKC").toLowerCase();
+    for (const word of CORPORATE_WORDS) text = text.split(word.toLowerCase()).join("");
+    text = text.replace(/[\s・･.,、。"'`]+/g, "");
+    return [...text].map((ch) => CONFUSABLES[ch] || ch).join("");
+  }
+
+  function similarity(a, b) {
+    if (a === b) return 1;
+    const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+    if (shorter.length >= 4 && longer.includes(shorter)) return 0.9;
+    const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i += 1) {
+      let diagonal = prev[0];
+      prev[0] = i;
+      for (let j = 1; j <= b.length; j += 1) {
+        const above = prev[j];
+        prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+        diagonal = above;
+      }
+    }
+    return 1 - prev[b.length] / Math.max(a.length, b.length, 1);
+  }
+
+  function updateProviderSuggestion() {
+    const value = $("entry-form").elements.provider_name.value.trim();
+    const box = $("provider-suggestion");
+    const names = state.meta.provider_names || [];
+    box.hidden = true;
+    if (!value || names.includes(value)) return;
+    const key = providerKey(value);
+    if (key.length < 2) return;
+    let best = null;
+    let bestScore = 0;
+    for (const name of names) {
+      const score = similarity(key, providerKey(name));
+      if (score > bestScore) {
+        best = name;
+        bestScore = score;
+      }
+    }
+    if (!best || bestScore < 0.8) return;
+    box.dataset.name = best;
+    $("provider-suggestion-text").textContent = `「${best}」と似ています。`;
+    box.hidden = false;
+  }
+
+  // ---------- 領収書の画像 ----------
+  async function showReceiptImage() {
+    const { entry } = state.editing || {};
+    if (!entry) return;
+    const image = $("receipt-image");
+    const message = $("receipt-image-message");
+    message.textContent = "画像を読み込んでいます…";
+    $("receipt-image-button").disabled = true;
+    try {
+      const body = await api("GET", `/entries/${encodeURIComponent(entry.entry_id)}/image`);
+      image.onload = () => {
+        message.textContent = "";
+      };
+      image.onerror = () => {
+        image.hidden = true;
+        message.textContent = "画像を表示できませんでした。もう一度お試しください。";
+        $("receipt-image-button").disabled = false;
+      };
+      image.src = body.url;
+      image.hidden = false;
+    } catch (error) {
+      if (error.status !== 401) message.textContent = error.message;
+      $("receipt-image-button").disabled = false;
+    }
   }
 
   // ---------- 編集ダイアログ ----------
@@ -394,6 +651,12 @@
     $("dialog-hint").textContent = hint.trim();
     $("delete-button").hidden = !entry;
     $("save-button").disabled = false;
+    $("receipt-image-area").hidden = !(entry && entry.source === "ocr");
+    $("receipt-image-button").disabled = false;
+    $("receipt-image-message").textContent = "";
+    $("receipt-image").hidden = true;
+    $("receipt-image").removeAttribute("src");
+    updateProviderSuggestion();
     $("entry-dialog").showModal();
   }
 
@@ -474,6 +737,7 @@
   async function refreshAfterChange() {
     try {
       state.meta = await api("GET", "/meta");
+      renderProviderOptions();
     } catch (_) {
       // 年の一覧の更新に失敗しても、明細の再読み込みは続ける
     }

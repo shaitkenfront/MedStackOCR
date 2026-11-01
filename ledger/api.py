@@ -15,7 +15,12 @@ from ledger.auth import (
     extract_bearer_token,
 )
 from ledger.models import MEDICAL_CATEGORIES, LedgerEntry
-from ledger.service import LedgerEntryNotFoundError, LedgerService, summarize_entries
+from ledger.service import (
+    LedgerEntryNotFoundError,
+    LedgerService,
+    ReceiptImageNotFoundError,
+    summarize_entries,
+)
 from ledger.validation import LedgerValidationError
 
 logger = logging.getLogger(__name__)
@@ -26,10 +31,13 @@ MIN_YEAR = 2000
 MAX_YEAR = 2100
 JST = timezone(timedelta(hours=9))
 
-_ENTRY_PATH_RE = re.compile(r"^/entries/(?P<entry_id>[A-Za-z0-9_\-]{1,100})$")
+_ENTRY_PATH_RE = re.compile(r"^/entries/(?P<entry_id>[A-Za-z0-9_\-]{1,100})(?P<image>/image)?$")
+IMAGE_URL_EXPIRES_SECONDS = 300
 
 # 画像パスを受け取り、原本画像を消す。消せなくても明細の削除自体は成功として扱う。
 ImageDeleter = Callable[[str], None]
+# 画像パスから、期限付きで閲覧できる URL を作る。画像が残っていなければ None。
+ImageUrlSigner = Callable[[str, int], "str | None"]
 
 
 @dataclass(slots=True)
@@ -91,11 +99,13 @@ class LedgerApi:
         verifier: LineIdTokenVerifier,
         *,
         image_deleter: ImageDeleter | None = None,
+        image_url_signer: ImageUrlSigner | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(JST),
     ) -> None:
         self.service = service
         self.verifier = verifier
         self.image_deleter = image_deleter
+        self.image_url_signer = image_url_signer
         self._now = now
 
     def handle(self, request: ApiRequest) -> ApiResponse:
@@ -126,7 +136,19 @@ class LedgerApi:
             self._require_method(method, {"GET"})
             report = self.service.check(user_id, self._year(request))
             return ApiResponse(200, report.to_dict())
+        if path == "/providers":
+            self._require_method(method, {"GET"})
+            return ApiResponse(200, self.service.provider_overview(user_id, self._year(request)))
+        if path == "/providers/rename":
+            self._require_method(method, {"POST"})
+            return self._rename_providers(user_id, self._json_body(request))
+        if path == "/providers/distinct":
+            self._require_method(method, {"POST"})
+            return self._mark_providers_distinct(user_id, self._json_body(request))
         match = _ENTRY_PATH_RE.match(path)
+        if match is not None and match.group("image"):
+            self._require_method(method, {"GET"})
+            return self._receipt_image(user_id, match.group("entry_id"))
         if match is not None:
             self._require_method(method, {"GET", "PATCH", "DELETE"})
             entry_id = match.group("entry_id")
@@ -160,8 +182,36 @@ class LedgerApi:
                 "years": years,
                 "medical_categories": list(MEDICAL_CATEGORIES),
                 "family_members": [str(member.get("canonical_name")) for member in members if member.get("canonical_name")],
+                "provider_names": self.service.known_provider_names(user_id),
             },
         )
+
+    def _rename_providers(self, user_id: str, body: dict[str, Any]) -> ApiResponse:
+        try:
+            updated = self.service.rename_providers(user_id, body.get("from_names"), str(body.get("to_name") or ""))
+        except LedgerValidationError as exc:
+            raise _validation_error(exc) from exc
+        return ApiResponse(200, {"updated": updated})
+
+    def _mark_providers_distinct(self, user_id: str, body: dict[str, Any]) -> ApiResponse:
+        try:
+            recorded = self.service.mark_providers_distinct(user_id, body.get("names"))
+        except LedgerValidationError as exc:
+            raise _validation_error(exc) from exc
+        return ApiResponse(200, {"recorded_pairs": recorded})
+
+    def _receipt_image(self, user_id: str, entry_id: str) -> ApiResponse:
+        not_found = _HttpError(404, "image_not_found", "領収書の画像はありません（手入力の明細か、保存期間を過ぎて削除されています）。")
+        try:
+            image_path = self.service.receipt_image_path(user_id, entry_id)
+        except LedgerEntryNotFoundError as exc:
+            raise _not_found() from exc
+        except ReceiptImageNotFoundError as exc:
+            raise not_found from exc
+        url = self.image_url_signer(image_path, IMAGE_URL_EXPIRES_SECONDS) if self.image_url_signer else None
+        if not url:
+            raise not_found
+        return ApiResponse(200, {"url": url, "expires_in": IMAGE_URL_EXPIRES_SECONDS})
 
     def _list_entries(self, user_id: str, year: int) -> ApiResponse:
         entries = self.service.list_entries(user_id, year)

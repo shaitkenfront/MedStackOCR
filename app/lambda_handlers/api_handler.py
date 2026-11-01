@@ -17,8 +17,10 @@ from ledger.service import LedgerService
 
 try:
     import boto3  # type: ignore
+    from botocore.config import Config as BotoConfig  # type: ignore
 except Exception:  # pragma: no cover - ローカル環境向けの import ガード
     boto3 = None
+    BotoConfig = None
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -47,6 +49,7 @@ def build_api_from_env(env: Any, *, dynamodb_resource: Any | None = None, s3_cli
         sessions_table_name=_optional(env.get("DDB_SESSIONS_TABLE")),
         aggregate_table_name=_optional(env.get("DDB_AGGREGATE_TABLE")),
         family_registry_table_name=_optional(env.get("DDB_FAMILY_TABLE")),
+        learning_table_name=_optional(env.get("DDB_LEARNING_TABLE")),
         dynamodb_resource=dynamodb_resource,
     )
     verifier = LineIdTokenVerifier(str(env.get("LINE_LOGIN_CHANNEL_ID") or ""))
@@ -55,7 +58,12 @@ def build_api_from_env(env: Any, *, dynamodb_resource: Any | None = None, s3_cli
 
     bucket = str(env.get("RECEIPT_BUCKET") or "").strip()
     if s3_client is None and boto3 is not None and bucket:
-        s3_client = boto3.client("s3")
+        # 署名付き URL を Lambda と同じリージョンのエンドポイントで発行する（リダイレクトによる署名不一致を避ける）
+        s3_client = boto3.client(
+            "s3",
+            region_name=_optional(env.get("AWS_REGION")),
+            config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}) if BotoConfig else None,
+        )
 
     def delete_image(image_path: str) -> None:
         target_bucket, key = _parse_s3_uri(image_path)
@@ -65,7 +73,36 @@ def build_api_from_env(env: Any, *, dynamodb_resource: Any | None = None, s3_cli
             return
         s3_client.delete_object(Bucket=target_bucket, Key=key)
 
-    return LedgerApi(LedgerService(repository), verifier, image_deleter=delete_image)
+    def sign_image_url(image_path: str, expires_in: int) -> str | None:
+        target_bucket, key = _parse_s3_uri(image_path)
+        if not key or s3_client is None or target_bucket != bucket:
+            return None
+        try:
+            s3_client.head_object(Bucket=target_bucket, Key=key)
+        except Exception as exc:  # 保存期間を過ぎて消えている場合など
+            if _is_not_found(exc):
+                return None
+            raise
+        return s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": target_bucket, "Key": key, "ResponseCacheControl": "private, no-store"},
+            ExpiresIn=expires_in,
+        )
+
+    return LedgerApi(
+        LedgerService(repository),
+        verifier,
+        image_deleter=delete_image,
+        image_url_signer=sign_image_url,
+    )
+
+
+def _is_not_found(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = str((response.get("Error") or {}).get("Code") or "")
+    return code in {"404", "NoSuchKey", "NotFound"}
 
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from ledger.models import SOURCE_OCR, STATUS_CONFIRMED, LedgerEntry
+from ledger.providers import find_variant_groups, provider_stats
 
 SEVERITY_ERROR = "error"  # 申告資料に載せる前に直す必要がある
 SEVERITY_WARNING = "warning"  # 確認を勧める
@@ -19,6 +20,8 @@ CODE_REIMBURSED_EXCEEDS = "reimbursed_exceeds_amount"
 CODE_DUPLICATE = "duplicate_candidate"
 CODE_UNKNOWN_FAMILY = "unknown_family_member"
 CODE_YEAR_DIFFERS = "year_differs_from_registration"
+CODE_PROVIDER_VARIANT = "provider_name_variant"
+CODE_PROVIDER_SUSPICIOUS = "provider_name_suspicious"
 
 
 @dataclass(slots=True)
@@ -28,6 +31,7 @@ class LedgerIssue:
     severity: str
     message: str
     related_entry_ids: list[str] = field(default_factory=list)
+    group_id: str | None = None  # 支払先の表記ゆれの組（支払先タブで開くため）
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -36,6 +40,7 @@ class LedgerIssue:
 def run_checks(
     entries: Iterable[LedgerEntry],
     family_members: Iterable[dict[str, Any]] = (),
+    distinct_provider_pair_keys: Iterable[str] = (),
 ) -> list[LedgerIssue]:
     """明細ごとの抜け漏れ・入力ミスの候補を返す。entries は対象年の明細を渡す。"""
     entry_list = list(entries)
@@ -45,6 +50,7 @@ def run_checks(
     for entry in entry_list:
         issues.extend(_check_entry(entry, known_names))
     issues.extend(_check_duplicates(entry_list))
+    issues.extend(_check_provider_names(entry_list, distinct_provider_pair_keys))
 
     order = {entry.entry_id: index for index, entry in enumerate(entry_list)}
     severity_rank = {SEVERITY_ERROR: 0, SEVERITY_WARNING: 1}
@@ -125,6 +131,38 @@ def _check_duplicates(entries: list[LedgerEntry]) -> list[LedgerIssue]:
                     related_entry_ids=[other for other in ids if other != entry.entry_id],
                 )
             )
+    return issues
+
+
+def _check_provider_names(entries: list[LedgerEntry], distinct_pair_keys: Iterable[str]) -> list[LedgerIssue]:
+    stats = provider_stats(entries)
+    issues: list[LedgerIssue] = []
+    for stat in stats:
+        if stat.suspicious_reason is None:
+            continue
+        for entry_id in stat.entry_ids:
+            issues.append(
+                LedgerIssue(
+                    entry_id=entry_id,
+                    code=CODE_PROVIDER_SUSPICIOUS,
+                    severity=SEVERITY_WARNING,
+                    message=f"支払先の名前に読み取りミスの疑いがあります（{stat.suspicious_reason}）。",
+                )
+            )
+    for group in find_variant_groups(stats, distinct_pair_keys):
+        for stat in group.names:
+            if stat.name == group.suggested_name:
+                continue
+            for entry_id in stat.entry_ids:
+                issues.append(
+                    LedgerIssue(
+                        entry_id=entry_id,
+                        code=CODE_PROVIDER_VARIANT,
+                        severity=SEVERITY_WARNING,
+                        message=f"支払先「{group.suggested_name}」と表記が似ています。同じ支払先なら名前をそろえてください。",
+                        group_id=group.group_id,
+                    )
+                )
     return issues
 
 

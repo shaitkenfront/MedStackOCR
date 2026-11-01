@@ -7,6 +7,14 @@ from uuid import uuid4
 from core.enums import FieldName
 from inbox.repository_interface import InboxRepositoryProtocol
 from ledger.checks import LedgerIssue, has_blocking_issues, run_checks
+from ledger.providers import (
+    alias_key,
+    comparison_key,
+    find_variant_groups,
+    normalize_display_name,
+    pair_key,
+    provider_stats,
+)
 from ledger.models import (
     CATEGORY_OTHER,
     MANUAL_ENTRY_PREFIX,
@@ -28,6 +36,13 @@ _RECEIPT_FIELD_SYNC: dict[str, str] = {
 
 class LedgerEntryNotFoundError(LookupError):
     pass
+
+
+class ReceiptImageNotFoundError(LookupError):
+    """手入力の明細、または保存期間を過ぎて画像が消えている。"""
+
+
+MAX_PROVIDER_NAMES_PER_REQUEST = 50
 
 
 @dataclass(slots=True)
@@ -141,8 +156,91 @@ class LedgerService:
         family_members = self.repository.list_family_members(line_user_id)
         return LedgerCheckReport(
             summary=summarize_entries(entries, year),
-            issues=run_checks(entries, family_members),
+            issues=run_checks(
+                entries,
+                family_members,
+                self.repository.list_provider_distinct_pair_keys(line_user_id),
+            ),
         )
+
+    # --- 支払先の名寄せ ---
+
+    def provider_overview(self, line_user_id: str, year: int) -> dict[str, Any]:
+        stats = provider_stats(self.list_entries(line_user_id, year))
+        groups = find_variant_groups(stats, self.repository.list_provider_distinct_pair_keys(line_user_id))
+        return {
+            "year": year,
+            "providers": [stat.to_dict() for stat in stats],
+            "groups": [group.to_dict() for group in groups],
+        }
+
+    def known_provider_names(self, line_user_id: str) -> list[str]:
+        """全年の支払先の名前（よく使う順）。入力欄の候補に使う。"""
+        entries = [LedgerEntry.from_row(row) for row in self.repository.list_ledger_rows(line_user_id)]
+        return [stat.name for stat in provider_stats(entries)]
+
+    def rename_providers(self, line_user_id: str, from_names: list[str], to_name: str) -> int:
+        """支払先の名前をそろえる（全年の明細が対象）。次回の OCR でも同じ名前に置き換えるよう記録する。"""
+        target = validate_entry_input({"provider_name": to_name}, partial=True)["provider_name"]
+        sources = _clean_names(from_names)
+        if not sources:
+            raise LedgerValidationError({"from_names": "そろえる名前を選んでください。"})
+
+        updated = 0
+        for row in self.repository.list_ledger_rows(line_user_id):
+            entry = LedgerEntry.from_row(row)
+            if entry.provider_name not in sources or entry.provider_name == target:
+                continue
+            self.update_entry(line_user_id, entry.entry_id, {"provider_name": target})
+            updated += 1
+        for name in sources:
+            if comparison_key(name) and name != target:
+                self.repository.upsert_provider_alias(line_user_id, alias_key(name), name, target)
+        return updated
+
+    def mark_providers_distinct(self, line_user_id: str, names: list[str]) -> int:
+        """「別の支払先です」。指定した名前どうしを、今後は表記ゆれの候補にしない。"""
+        cleaned = _clean_names(names)
+        if len(cleaned) < 2:
+            raise LedgerValidationError({"names": "2つ以上の名前を指定してください。"})
+        pairs = [
+            (pair_key(a, b), a, b)
+            for index, a in enumerate(cleaned)
+            for b in cleaned[index + 1:]
+        ]
+        self.repository.add_provider_distinct_pairs(line_user_id, pairs)
+        return len(pairs)
+
+    def receipt_image_path(self, line_user_id: str, entry_id: str) -> str:
+        entry = self.get_entry(line_user_id, entry_id)
+        if entry.source != SOURCE_OCR:
+            raise ReceiptImageNotFoundError(entry_id)
+        path = self.repository.get_receipt_image_path(line_user_id, entry.entry_id)
+        if not path:
+            raise ReceiptImageNotFoundError(entry_id)
+        return path
+
+
+def apply_provider_alias(repository: InboxRepositoryProtocol, line_user_id: str, name: Any) -> str | None:
+    """OCR で読み取った支払先の名前を、利用者が以前そろえた名前に置き換える。該当がなければ None。"""
+    display = normalize_display_name(name)
+    if not display or not comparison_key(display):
+        return None
+    canonical = repository.get_provider_alias(line_user_id, alias_key(display))
+    if not canonical or canonical == display:
+        return None
+    return canonical
+
+
+def _clean_names(names: Any) -> list[str]:
+    if not isinstance(names, list):
+        return []
+    cleaned: list[str] = []
+    for name in names[:MAX_PROVIDER_NAMES_PER_REQUEST]:
+        text = str(name or "").strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
 
 
 def entry_belongs_to_year(entry: LedgerEntry, year: int) -> bool:

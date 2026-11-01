@@ -171,6 +171,27 @@ class LedgerServiceContract:
         self.assertEqual(report.issues[0].severity, "error")
 
 
+    def test_provider_distinct_pairs_and_alias_round_trip(self) -> None:
+        service = self.make_service()
+        service.create_manual_entry("U1", dict(TRANSPORT_INPUT, provider_name="さくら薬局"))
+        service.create_manual_entry("U1", dict(TRANSPORT_INPUT, provider_name="さくら薬局 本町店"))
+        self.assertEqual(len(service.provider_overview("U1", 2026)["groups"]), 1)
+        service.mark_providers_distinct("U1", ["さくら薬局", "さくら薬局 本町店"])
+        self.assertEqual(service.provider_overview("U1", 2026)["groups"], [])
+        self.assertEqual(self.repo.list_provider_distinct_pair_keys("U2"), [])
+
+        service.rename_providers("U1", ["さくら薬局"], "さくら薬局 駅前店")
+        from ledger.service import apply_provider_alias
+
+        self.assertEqual(apply_provider_alias(self.repo, "U1", "さくら 薬局"), "さくら薬局 駅前店")
+        self.assertIsNone(apply_provider_alias(self.repo, "U2", "さくら薬局"))
+
+    def test_receipt_image_path_is_owner_only(self) -> None:
+        self.add_ocr_entry()
+        self.assertEqual(self.make_service().receipt_image_path("U1", "R1"), "s3://bucket/R1.jpg")
+        self.assertIsNone(self.repo.get_receipt_image_path("U2", "R1"))
+
+
 class SqliteLedgerServiceTest(LedgerServiceContract, unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -242,6 +263,7 @@ def _create_tables(ddb: Any) -> None:
         ("t-aggregate-entries", key_schema("line_user_id", "service_date_receipt"),
          string_attrs("line_user_id", "service_date_receipt", "receipt_id"), [gsi("receipt_id_index", "receipt_id")]),
         ("t-family-registry", key_schema("line_user_id", "record_type"), string_attrs("line_user_id", "record_type"), []),
+        ("t-learning-rules", key_schema("line_user_id", "rule_key"), string_attrs("line_user_id", "rule_key"), []),
     ]
     for name, keys, attrs, indexes in tables:
         kwargs: dict[str, Any] = {

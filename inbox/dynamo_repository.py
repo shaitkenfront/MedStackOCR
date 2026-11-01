@@ -914,6 +914,77 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         )
         return True
 
+    # --- 支払先の名寄せ（学習ルールテーブルに rule_key の接頭辞を分けて保存） ---
+    def list_provider_distinct_pair_keys(self, line_user_id: str) -> list[str]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return []
+        rows = self._query_learning_items(user_id, _PROVIDER_DISTINCT_PREFIX, projection="rule_key")
+        return [str(row["rule_key"])[len(_PROVIDER_DISTINCT_PREFIX):] for row in rows]
+
+    def add_provider_distinct_pairs(self, line_user_id: str, pairs: list[tuple[str, str, str]]) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not pairs:
+            return
+        now = _utc_now()
+        with self._learning_table.batch_writer(overwrite_by_pkeys=["line_user_id", "rule_key"]) as batch:
+            for key, name_a, name_b in pairs:
+                batch.put_item(
+                    Item={
+                        "line_user_id": user_id,
+                        "rule_key": f"{_PROVIDER_DISTINCT_PREFIX}{key}",
+                        "name_a": name_a,
+                        "name_b": name_b,
+                        "created_at": now,
+                    }
+                )
+
+    def upsert_provider_alias(self, line_user_id: str, alias_key: str, variant_name: str, canonical_name: str) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not alias_key or not canonical_name:
+            return
+        self._learning_table.put_item(
+            Item={
+                "line_user_id": user_id,
+                "rule_key": f"{_PROVIDER_ALIAS_PREFIX}{alias_key}",
+                "variant_name": variant_name,
+                "canonical_name": canonical_name,
+                "updated_at": _utc_now(),
+            }
+        )
+
+    def get_provider_alias(self, line_user_id: str, alias_key: str) -> str | None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not alias_key:
+            return None
+        item = self._learning_table.get_item(
+            Key={"line_user_id": user_id, "rule_key": f"{_PROVIDER_ALIAS_PREFIX}{alias_key}"}
+        ).get("Item")
+        name = str((item or {}).get("canonical_name") or "").strip()
+        return name or None
+
+    def get_receipt_image_path(self, line_user_id: str, receipt_id: str) -> str | None:
+        rid = str(receipt_id or "").strip()
+        if not rid:
+            return None
+        row = self._receipts_table.get_item(Key={"receipt_id": rid}).get("Item")
+        if row is None or str(row.get("line_user_id", "")) != str(line_user_id or "").strip():
+            return None
+        return str(row.get("image_path") or "").strip() or None
+
+    def _query_learning_items(self, line_user_id: str, prefix: str, *, projection: str) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("line_user_id").eq(line_user_id) & Key("rule_key").begins_with(prefix),
+            "ProjectionExpression": projection,
+        }
+        items: list[dict[str, Any]] = []
+        while True:
+            response = self._learning_table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                return items
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
     def _find_owned_aggregate(self, line_user_id: str, entry_id: str) -> dict[str, Any] | None:
         user_id = str(line_user_id or "").strip()
         eid = str(entry_id or "").strip()
@@ -1182,6 +1253,9 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         items = response.get("Items", [])
         return items[0] if items else None
 
+
+_PROVIDER_DISTINCT_PREFIX = "PROVIDER_DISTINCT#"
+_PROVIDER_ALIAS_PREFIX = "PROVIDER_ALIAS#"
 
 _LEDGER_WRITABLE_ATTRIBUTES = frozenset(
     {

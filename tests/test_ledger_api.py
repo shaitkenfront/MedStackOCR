@@ -200,5 +200,49 @@ class LedgerApiTest(unittest.TestCase):
             LineIdTokenVerifier("", http_post=wrong_aud).verify("t")
 
 
+
+class LedgerApiProviderAndImageTest(LedgerApiTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.signed: list[tuple[str, int]] = []
+
+        def signer(path: str, expires: int) -> str | None:
+            self.signed.append((path, expires))
+            return None if path.endswith("gone.jpg") else f"https://signed.example/{path.rsplit('/', 1)[-1]}"
+
+        self.api.image_url_signer = signer
+
+    def test_provider_endpoints(self) -> None:
+        for date, name in (("2026-01-05", "さくら薬局 駅前店"), ("2026-02-05", "さくら薬局 駅前店"), ("2026-03-05", "さくら薬局駅前庖")):
+            self.call("POST", "/api/entries", body={"service_date": date, "provider_name": name, "family_member_name": "山田 太郎", "amount_yen": 100})
+
+        status, body = self.call("GET", "/api/providers", query={"year": "2026"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["groups"]), 1)
+        self.assertEqual(body["groups"][0]["suggested_name"], "さくら薬局 駅前店")
+
+        status, body = self.call("POST", "/api/providers/rename", body={"from_names": ["さくら薬局駅前庖"], "to_name": "さくら薬局 駅前店"})
+        self.assertEqual((status, body["updated"]), (200, 1))
+        self.assertEqual(self.call("GET", "/api/providers", query={"year": "2026"})[1]["groups"], [])
+        self.assertEqual(self.call("GET", "/api/meta")[1]["provider_names"], ["さくら薬局 駅前店"])
+
+        status, body = self.call("POST", "/api/providers/distinct", body={"names": ["さくら薬局 駅前店"]})
+        self.assertEqual((status, body["error"]), (400, "validation_error"))
+        self.assertEqual(self.call("GET", "/api/providers/rename")[0], 405)
+
+    def test_receipt_image(self) -> None:
+        self.add_ocr_entry("R1")
+        status, body = self.call("GET", "/api/entries/R1/image")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["url"], "https://signed.example/R1.jpg")
+        self.assertEqual(self.signed, [("s3://bucket/R1.jpg", 300)])
+        # 他人の明細・手入力の明細は画像を返さない
+        self.assertEqual(self.call("GET", "/api/entries/R1/image", token="token-u2")[0], 404)
+        manual = self.call("POST", "/api/entries", body={"service_date": "2026-01-05", "provider_name": "タクシー", "family_member_name": "山田 太郎", "amount_yen": 100})[1]
+        status, body = self.call("GET", f"/api/entries/{manual['entry']['entry_id']}/image")
+        self.assertEqual((status, body["error"]), (404, "image_not_found"))
+        self.assertEqual(self.call("DELETE", "/api/entries/R1/image")[0], 405)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,9 @@
       <button type="button" role="tab" id="tab-checks" aria-selected="false" aria-controls="panel-checks">
         チェック<span class="tab-badge" id="checks-badge" hidden></span>
       </button>
+      <button type="button" role="tab" id="tab-providers" aria-selected="false" aria-controls="panel-providers">
+        支払先<span class="tab-badge" id="providers-badge" hidden></span>
+      </button>
     </nav>
 
     <section id="panel-entries" role="tabpanel" aria-labelledby="tab-entries" hidden>
@@ -51,6 +54,10 @@
           <input type="checkbox" id="issues-only"> 要確認のみ
         </label>
       </div>
+      <p class="filter-chip" id="provider-filter-chip" hidden>
+        <span id="provider-filter-label"></span>
+        <button type="button" id="provider-filter-clear" aria-label="支払先の絞り込みを解除">✕</button>
+      </p>
       <ul class="entry-list" id="entry-list"></ul>
       <p class="empty" id="entries-empty" hidden>この年の明細はまだありません。</p>
     </section>
@@ -58,6 +65,15 @@
     <section id="panel-checks" role="tabpanel" aria-labelledby="tab-checks" hidden>
       <p class="check-lead" id="check-lead"></p>
       <ul class="issue-list" id="issue-list"></ul>
+    </section>
+
+    <section id="panel-providers" role="tabpanel" aria-labelledby="tab-providers" hidden>
+      <h2 class="section-title">表記ゆれの候補</h2>
+      <p class="section-lead" id="groups-lead"></p>
+      <div class="group-list" id="group-list"></div>
+      <h2 class="section-title">すべての支払先</h2>
+      <p class="section-lead">名前をタップすると、その支払先の明細を表示します。</p>
+      <ul class="provider-list" id="provider-list"></ul>
     </section>
   </main>
 
@@ -67,6 +83,11 @@
     <form id="entry-form" method="dialog" novalidate>
       <h2 id="dialog-title">明細の編集</h2>
       <p class="dialog-hint" id="dialog-hint"></p>
+      <div class="receipt-image" id="receipt-image-area" hidden>
+        <button type="button" id="receipt-image-button">領収書の画像を見る</button>
+        <p class="field-help" id="receipt-image-message" role="status"></p>
+        <img id="receipt-image" alt="LINEで送った領収書の画像" hidden>
+      </div>
 
       <label class="field">
         <span>支払日</span>
@@ -75,7 +96,12 @@
       </label>
       <label class="field">
         <span>病院・薬局などの支払先</span>
-        <input type="text" name="provider_name" maxlength="100" required autocomplete="off">
+        <input type="text" name="provider_name" maxlength="100" required autocomplete="off" list="provider-options">
+        <datalist id="provider-options"></datalist>
+        <span class="suggestion" id="provider-suggestion" hidden>
+          <span id="provider-suggestion-text"></span>
+          <button type="button" id="provider-suggestion-apply">そろえる</button>
+        </span>
         <small class="field-error" data-error-for="provider_name"></small>
       </label>
       <label class="field">
