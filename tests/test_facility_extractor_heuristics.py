@@ -108,6 +108,46 @@ class FacilityHeuristicsTest(unittest.TestCase):
         self.assertEqual(top_payer(DocumentType.CLINIC_OR_HOSPITAL, lines), "東京都立駒込病院")
 
 
+class ProductionRegressionTest(unittest.TestCase):
+    """本番の領収書の評価で見つかった誤り（名前は架空のものに置き換え）。"""
+
+    def test_dental_fee_item_is_not_a_name(self) -> None:
+        lines = receipt(
+            ("歯冠修復及び欠損補綴歯科矯正", 0.4, 0.035),
+            ("医療法人社団ABC あおば歯科", 0.71),
+            ("TEL 03-0000-0000", 0.75),
+        )
+        self.assertEqual(top_payer(DocumentType.UNKNOWN, lines), "あおば歯科")
+
+    def test_known_prescribing_clinic_does_not_beat_pharmacy(self) -> None:
+        lines = receipt(
+            ("処方箋", 0.3),
+            ("みどり眼科 山田花子先生", 0.34, 0.045),
+            ("ひまわり薬局", 0.77),
+            ("〒700-0000 岡山県岡山市北区", 0.8),
+        )
+        candidates = FacilityExtractor().extract(DocumentType.PHARMACY, lines, known_names=["みどり眼科", "ひまわり薬局"])
+        self.assertEqual(candidates[FieldName.PAYER_FACILITY_NAME][0].value_normalized, "ひまわり薬局")
+        self.assertEqual(candidates[FieldName.PRESCRIBING_FACILITY_NAME][0].value_normalized, "みどり眼科")
+
+    def test_generic_name_label_is_removed(self) -> None:
+        lines = receipt(("クリニック名: 医療法人さくらクリニック", 0.1), ("TEL 03-0000-0000", 0.14))
+        self.assertEqual(top_payer(DocumentType.CLINIC_OR_HOSPITAL, lines), "医療法人さくらクリニック")
+
+    def test_department_list_is_not_a_name(self) -> None:
+        lines = receipt(
+            ("内科・小児科", 0.08, 0.05),
+            ("皮膚科・形成外科", 0.12, 0.05),
+            ("医療法人 もりの内科医院", 0.8),
+            ("TEL 086-000-0000", 0.84),
+        )
+        self.assertEqual(top_payer(DocumentType.CLINIC_OR_HOSPITAL, lines), "もりの内科医院")
+
+    def test_two_character_fragment_is_not_a_name(self) -> None:
+        lines = receipt(("局み", 0.2, 0.06), ("合計 1,000円", 0.5))
+        self.assertIsNone(top_payer(DocumentType.PHARMACY, lines))
+
+
 class TwoLineNameTest(unittest.TestCase):
     def test_name_split_over_two_lines_is_joined(self) -> None:
         lines = receipt(

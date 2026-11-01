@@ -51,6 +51,32 @@ CLINIC_KEYWORDS = (
     "訪問看護",
 )
 FACILITY_KEYWORDS = PHARMACY_KEYWORDS + CLINIC_KEYWORDS
+# 診療科の一覧の行（「内科・小児科」など）を見分けるための診療科名
+DEPARTMENT_WORDS = CLINIC_KEYWORDS + (
+    "形成外科",
+    "整形外科",
+    "脳神経外科",
+    "心臓血管外科",
+    "呼吸器外科",
+    "消化器外科",
+    "循環器内科",
+    "消化器内科",
+    "呼吸器内科",
+    "神経内科",
+    "脳神経内科",
+    "糖尿病内科",
+    "腎臓内科",
+    "リウマチ科",
+    "アレルギー科",
+    "麻酔科",
+    "放射線科",
+    "リハビリテーション科",
+    "産科",
+    "矯正歯科",
+    "小児歯科",
+    "口腔外科",
+    "歯科口腔外科",
+)
 CORPORATE_WORDS = (
     "医療法人",
     "社会医療法人",
@@ -67,7 +93,7 @@ CORPORATE_WORDS = (
     "社会福祉法人",
     "独立行政法人",
 )
-PRESCRIBING_CONTEXT = ("処方箋", "処方せん", "保険医療機関", "交付", "医師")
+PRESCRIBING_CONTEXT = ("処方箋", "処方せん", "保険医療機関", "交付", "医師", "先生")
 CONTACT_ANCHORS = ("〒", "TEL", "Tel", "tel", "℡", "電話", "FAX", "Fax")
 # 発行元の欄の目印（近くにあれば少し加点する。住所・電話番号ほど強い手がかりではない）
 ISSUER_ANCHORS = CONTACT_ANCHORS + ("領収書", "発行")
@@ -128,6 +154,16 @@ NON_NAME_HINTS = (
     "手術",
     "麻酔",
     "食事療養",
+    "医学管理",
+    "専門療法",
+    "放射線治療",
+    "病理診断",
+    "歯冠修復",
+    "欠損補",
+    "補綴",
+    "歯科矯正",
+    "負担",
+    "内訳",
     "保険外",
     "自費",
     "一部負担",
@@ -179,6 +215,10 @@ RE_NAME_PREFIX = re.compile(
     r"^(処方箋交付医療機関|保険医療機関|医療機関名|医療機関|病院名|医院名|薬局名|調剤薬局名|"
     r"発行元|請求元|発行者|店舗名|店名|施設名)\s*[:：]?\s*"
 )
+# 「クリニック名:」「医療機関名称：」のような「〇〇名:」形式のラベル
+RE_GENERIC_NAME_LABEL = re.compile(r"^[^\s:：]{1,10}(名|名称)\s*[:：]\s*")
+# 処方元の行に続く医師名（例: 「岡山西眼科 吉武恭子先生」）
+RE_DOCTOR_SUFFIX = re.compile(r"\s+[^\s]{1,10}(先生|医師)$")
 RE_CONTACT_SPLIT = re.compile(r"(TEL|Tel|tel|℡|電話|FAX|Fax|〒)")
 RE_ADDRESS = re.compile(
     r"(東京都|北海道|(京都|大阪)府|.{2,3}県).{0,8}?[市区町村郡]"
@@ -299,7 +339,8 @@ class FacilityExtractor:
             score += 1.2
             evidence = True
             reasons.append("store_suffix")
-        if contains_any(cleaned, CORPORATE_WORDS):
+        # 法人格は名前から外していることがあるので、元の行で判定する
+        if contains_any(line.text, CORPORATE_WORDS):
             score += 0.6
             evidence = True
             reasons.append("contains_corporate_word")
@@ -353,8 +394,9 @@ class FacilityExtractor:
         elif document_type == DocumentType.PHARMACY and context.is_near_prescribing(line):
             score -= 3.0
             reasons.append("near_prescribing_context_penalty")
-        if document_type == DocumentType.PHARMACY and has_clinic and not has_pharmacy and known is None:
-            # 薬局の領収書に載る病院名は、たいてい処方箋を出した医療機関
+        if document_type == DocumentType.PHARMACY and has_clinic and not has_pharmacy:
+            # 薬局の領収書に載る病院名は、たいてい処方箋を出した医療機関。
+            # 家族の通院先は確定済みの支払先にも入っているので、一致していても減点する
             score -= 2.5
             reasons.append("clinic_name_on_pharmacy_receipt_penalty")
 
@@ -446,7 +488,7 @@ class FacilityExtractor:
         if not t:
             return False
         compact = re.sub(r"\s+", "", t)
-        if len(compact) < 2 or len(t) > 64:
+        if len(compact) < 3 or len(t) > 64:
             return False
         upper_t = t.upper()
         if t.startswith("〒") or upper_t.startswith("TEL") or "FAX" in upper_t:
@@ -456,6 +498,8 @@ class FacilityExtractor:
         if compact in NON_NAME_EXACT:
             return False
         if compact.endswith(("様", "殿")):
+            return False
+        if _is_department_list(compact):
             return False
         if (":" in t or "：" in t) and not contains_any(t, FACILITY_KEYWORDS):
             return False
@@ -478,7 +522,18 @@ class FacilityExtractor:
         if len(re.sub(r"\s+", "", head)) >= 2:
             cleaned = head
         cleaned = RE_NAME_PREFIX.sub("", cleaned)
+        cleaned = RE_GENERIC_NAME_LABEL.sub("", cleaned)
+        cleaned = RE_DOCTOR_SUFFIX.sub("", cleaned)
         cleaned = cleaned.strip(" :：")
+        # 「医療法人社団〇〇 きれいわ歯科」のように空白で区切られた法人格の部分は外し、施設名だけにする
+        head, _, rest = cleaned.partition(" ")
+        if (
+            rest
+            and contains_any(head, CORPORATE_WORDS)
+            and not contains_any(head, FACILITY_KEYWORDS)
+            and contains_any(rest, FACILITY_KEYWORDS)
+        ):
+            cleaned = rest.strip()
         # 「保険薬局 さくら薬局」のような表示は、名前の部分だけにする
         if cleaned.startswith("保険薬局"):
             rest = cleaned[len("保険薬局"):].strip(" :：")
@@ -635,6 +690,15 @@ class _PageContext:
                 best = other
                 best_gap = gap
         return best
+
+
+def _is_department_list(compact: str) -> bool:
+    """「内科・小児科」のように診療科の名前だけでできた行（施設の名前ではない）か。"""
+    rest = compact
+    for keyword in sorted(DEPARTMENT_WORDS, key=len, reverse=True):
+        rest = rest.replace(keyword, "")
+    rest = re.sub(r"[・･、,/／()（）]", "", rest)
+    return rest != compact and len(rest) <= 1
 
 
 def _keyword_ends_name(text: str) -> bool:
