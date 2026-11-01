@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>医療費の明細</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js" charset="utf-8" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>医療費の明細</h1>
+    <label class="year-picker">
+      <span class="visually-hidden">対象の年</span>
+      <select id="year-select" aria-label="対象の年"></select>
+    </label>
+  </header>
+
+  <main id="app" aria-busy="true">
+    <p id="status-message" class="status" role="status">読み込み中です…</p>
+
+    <section id="summary" class="summary" hidden aria-label="集計">
+      <div class="summary-main">
+        <span class="summary-label">支払った医療費</span>
+        <span class="summary-value" id="summary-total">0円</span>
+      </div>
+      <dl class="summary-grid">
+        <div><dt>補填される金額</dt><dd id="summary-reimbursed">0円</dd></div>
+        <div><dt>差引額</dt><dd id="summary-net">0円</dd></div>
+        <div><dt>明細の件数</dt><dd id="summary-count">0件</dd></div>
+        <div><dt>未確定</dt><dd id="summary-unconfirmed">0件</dd></div>
+      </dl>
+      <p class="summary-note">医療費控除の対象になるのは、差引額から10万円（総所得金額等が200万円未満の人はその5%）を引いた額です。</p>
+    </section>
+
+    <nav class="tabs" id="tabs" hidden role="tablist">
+      <button type="button" role="tab" id="tab-entries" aria-selected="true" aria-controls="panel-entries">明細一覧</button>
+      <button type="button" role="tab" id="tab-checks" aria-selected="false" aria-controls="panel-checks">
+        チェック<span class="tab-badge" id="checks-badge" hidden></span>
+      </button>
+    </nav>
+
+    <section id="panel-entries" role="tabpanel" aria-labelledby="tab-entries" hidden>
+      <div class="toolbar">
+        <select id="member-filter" aria-label="医療を受けた人で絞り込む">
+          <option value="">全員</option>
+        </select>
+        <label class="toggle">
+          <input type="checkbox" id="issues-only"> 要確認のみ
+        </label>
+      </div>
+      <ul class="entry-list" id="entry-list"></ul>
+      <p class="empty" id="entries-empty" hidden>この年の明細はまだありません。</p>
+    </section>
+
+    <section id="panel-checks" role="tabpanel" aria-labelledby="tab-checks" hidden>
+      <p class="check-lead" id="check-lead"></p>
+      <ul class="issue-list" id="issue-list"></ul>
+    </section>
+  </main>
+
+  <button type="button" class="fab" id="add-button" hidden>＋ 手入力で追加</button>
+
+  <dialog id="entry-dialog" aria-labelledby="dialog-title">
+    <form id="entry-form" method="dialog" novalidate>
+      <h2 id="dialog-title">明細の編集</h2>
+      <p class="dialog-hint" id="dialog-hint"></p>
+
+      <label class="field">
+        <span>支払日</span>
+        <input type="date" name="service_date" required>
+        <small class="field-error" data-error-for="service_date"></small>
+      </label>
+      <label class="field">
+        <span>病院・薬局などの支払先</span>
+        <input type="text" name="provider_name" maxlength="100" required autocomplete="off">
+        <small class="field-error" data-error-for="provider_name"></small>
+      </label>
+      <label class="field">
+        <span>医療を受けた人</span>
+        <input type="text" name="family_member_name" maxlength="50" list="family-options" required autocomplete="off">
+        <datalist id="family-options"></datalist>
+        <small class="field-error" data-error-for="family_member_name"></small>
+      </label>
+      <label class="field">
+        <span>医療費の区分</span>
+        <select name="medical_category"></select>
+        <small class="field-error" data-error-for="medical_category"></small>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span>支払った金額（円）</span>
+          <input type="text" name="amount_yen" inputmode="numeric" required autocomplete="off">
+          <small class="field-error" data-error-for="amount_yen"></small>
+        </label>
+        <label class="field">
+          <span>補填される金額（円）</span>
+          <input type="text" name="reimbursed_yen" inputmode="numeric" autocomplete="off" placeholder="0">
+          <small class="field-error" data-error-for="reimbursed_yen"></small>
+        </label>
+      </div>
+      <p class="field-help">補填される金額：保険金や高額療養費など、あとで戻ってくるお金。</p>
+      <label class="field">
+        <span>メモ</span>
+        <textarea name="note" rows="2" maxlength="500" placeholder="例：自宅→〇〇病院 バス往復"></textarea>
+        <small class="field-error" data-error-for="note"></small>
+      </label>
+      <label class="field">
+        <span>状態</span>
+        <select name="status">
+          <option value="confirmed">確定</option>
+          <option value="hold">保留</option>
+        </select>
+        <small class="field-error" data-error-for="status"></small>
+      </label>
+      <p class="form-error" id="form-error" role="alert"></p>
+
+      <div class="dialog-actions">
+        <button type="button" class="danger" id="delete-button">削除</button>
+        <span class="spacer"></span>
+        <button type="button" id="cancel-button">キャンセル</button>
+        <button type="submit" class="primary" id="save-button">保存</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

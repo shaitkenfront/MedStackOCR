@@ -180,6 +180,8 @@ class LedgerApiTest(unittest.TestCase):
         self.assertEqual((request.method, request.path, request.body), ("POST", "/api/entries", "{\"a\": 1}"))
         self.assertEqual(extract_bearer_token(request.headers), "abc")
         self.assertEqual(request.query, {"year": "2026"})
+        self.assertEqual(extract_bearer_token({"X-Line-Id-Token": "xyz", "Authorization": "Bearer abc"}), "xyz")
+        self.assertEqual(extract_bearer_token({"Authorization": "Basic abc"}), "")
 
     def test_verifier_rejects_wrong_audience_and_expired(self) -> None:
         def wrong_aud(url: str, form: dict[str, str]) -> tuple[int, str]:

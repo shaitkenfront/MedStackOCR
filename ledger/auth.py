@@ -95,13 +95,19 @@ class LineIdTokenVerifier:
         return verified
 
 
+ID_TOKEN_HEADER = "x-line-id-token"
+
+
 def extract_bearer_token(headers: dict[str, str] | None) -> str:
-    for key, value in (headers or {}).items():
-        if str(key).lower() != "authorization":
-            continue
-        scheme, _, token = str(value or "").partition(" ")
-        if scheme.lower() == "bearer":
-            return token.strip()
+    """ID トークンを取り出す。CloudFront 経由では Authorization ヘッダーがオリジンへ転送されない
+    構成があるため、画面からは専用ヘッダー（X-Line-Id-Token）で送り、Authorization: Bearer も受け付ける。"""
+    lowered = {str(key).lower(): str(value or "") for key, value in (headers or {}).items()}
+    custom = lowered.get(ID_TOKEN_HEADER, "").strip()
+    if custom:
+        return custom
+    scheme, _, token = lowered.get("authorization", "").partition(" ")
+    if scheme.lower() == "bearer":
+        return token.strip()
     return ""
 
 

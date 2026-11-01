@@ -9,11 +9,14 @@ from aws_cdk import (
     Stack,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as apigwv2_integrations,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as cloudfront_origins,
     aws_dynamodb as dynamodb,
     aws_kms as kms,
     aws_lambda as lambda_,
     aws_lambda_event_sources as lambda_event_sources,
     aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
     aws_secretsmanager as secretsmanager,
     aws_sqs as sqs,
 )
@@ -34,6 +37,8 @@ class MedstackHybridStack(Stack):
         config_path = str(self.node.try_get_context("config_path") or "config.yaml")
         # LIFF の ID トークン検証に使う LINE Login チャネル ID（Messaging API チャネルと同じプロバイダーに作る）
         line_login_channel_id = str(self.node.try_get_context("line_login_channel_id") or "")
+        # LIFF アプリの ID。LIFF アプリ作成時にエンドポイント URL（LiffEndpointUrl 出力）が必要なため、初回デプロイ後に設定する
+        liff_id = str(self.node.try_get_context("liff_id") or "")
         app_secret = (
             secretsmanager.Secret.from_secret_name_v2(
                 self,
@@ -231,6 +236,7 @@ class MedstackHybridStack(Stack):
             "external/**",
             "tests/**",
             "infra/**",
+            "web/**",
             "cdk.out/**",
             "*.md",
             "PLAN*.md",
@@ -372,6 +378,93 @@ class MedstackHybridStack(Stack):
             integration=ledger_api_integration,
         )
 
+        # --- LIFF 画面: S3 の静的ファイルと /api/* を CloudFront の同じドメインで配信（CORS 不要にする） ---
+        liff_web_bucket = s3.Bucket(
+            self,
+            "LiffWebBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+        liff_security_headers = cloudfront.ResponseHeadersPolicy(
+            self,
+            "LiffSecurityHeaders",
+            response_headers_policy_name=f"{prefix}-liff-security-headers",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    content_security_policy=(
+                        "default-src 'self'; "
+                        "script-src 'self' https://static.line-scdn.net https://*.line-scdn.net; "
+                        "connect-src 'self' https://*.line.me https://*.line-scdn.net https://*.line-apps.com; "
+                        "img-src 'self' data: https:; "
+                        "style-src 'self'; "
+                        "frame-src https://*.line.me; "
+                        "base-uri 'none'; form-action 'self'; object-src 'none'"
+                    ),
+                    override=True,
+                ),
+                content_type_options=cloudfront.ResponseHeadersContentTypeOptions(override=True),
+                frame_options=cloudfront.ResponseHeadersFrameOptions(
+                    frame_option=cloudfront.HeadersFrameOption.DENY,
+                    override=True,
+                ),
+                referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
+                    referrer_policy=cloudfront.HeadersReferrerPolicy.NO_REFERRER,
+                    override=True,
+                ),
+                strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                    access_control_max_age=Duration.days(365),
+                    include_subdomains=True,
+                    override=True,
+                ),
+            ),
+        )
+        ledger_api_origin = cloudfront_origins.HttpOrigin(
+            f"{line_webhook_api.api_id}.execute-api.{self.region}.{self.url_suffix}",
+            protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        )
+        liff_distribution = cloudfront.Distribution(
+            self,
+            "LiffDistribution",
+            comment=f"{prefix} LIFF ledger",
+            default_root_object="index.html",
+            minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+            price_class=cloudfront.PriceClass.PRICE_CLASS_200,
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(liff_web_bucket),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+                response_headers_policy=liff_security_headers,
+            ),
+            additional_behaviors={
+                "/api/*": cloudfront.BehaviorOptions(
+                    origin=ledger_api_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+                    response_headers_policy=liff_security_headers,
+                ),
+            },
+        )
+        web_asset_path = str(Path(__file__).resolve().parents[2] / "web" / "liff")
+        s3deploy.BucketDeployment(
+            self,
+            "LiffWebDeployment",
+            destination_bucket=liff_web_bucket,
+            sources=[
+                s3deploy.Source.asset(web_asset_path),
+                s3deploy.Source.json_data("config.json", {"liffId": liff_id, "apiBase": "/api"}),
+            ],
+            # 画面の更新がすぐ反映されるよう、HTML/JS/CSS はキャッシュさせない（ファイルが小さく件数も少ないため）
+            cache_control=[s3deploy.CacheControl.from_string("no-cache")],
+            distribution=liff_distribution,
+            distribution_paths=["/*"],
+        )
+
+        CfnOutput(self, "LiffEndpointUrl", value=f"https://{liff_distribution.distribution_domain_name}/")
         CfnOutput(self, "LineWebhookUrl", value=f"{line_webhook_api.api_endpoint}{line_webhook_path}")
         CfnOutput(self, "LedgerApiBaseUrl", value=f"{line_webhook_api.api_endpoint}/api")
         CfnOutput(self, "LineEventsQueueUrl", value=line_events_queue.queue_url)

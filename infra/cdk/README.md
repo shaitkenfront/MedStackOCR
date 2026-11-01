@@ -100,3 +100,19 @@ OCR利用制限カウンタは `OcrUsageGuardTableName` 出力の DynamoDB テ�
    別のプロバイダーだとユーザー ID が一致せず、LINE で登録した明細が画面に表示されません。
 2. チャネル基本設定の「チャネル ID」を `cdk.json` の `line_login_channel_id` に設定する（非機密値）。
 3. 未設定のままデプロイすると、API はすべてのリクエストを 401 で拒否します。
+
+## 6. 明細画面（LIFF）の公開
+
+画面（`web/liff/`）は CloudFront から配信し、同じドメインの `/api/*` を明細 API に転送します（CORS 設定は不要）。
+LIFF アプリの作成にはエンドポイント URL が必要なため、初回は2回デプロイします。
+
+1. `cdk deploy` を実行し、出力 `LiffEndpointUrl`（`https://xxxx.cloudfront.net/`）を控える。
+2. LINE Developers Console の LINE Login チャネルで「LIFF」タブからアプリを追加する。
+   - サイズ: `Full`
+   - エンドポイント URL: 手順1の `LiffEndpointUrl`
+   - Scope: `openid` のみ（`profile` は不要）
+   - 友だち追加オプション: `On (Normal)` 推奨（Bot と連携させるため）
+3. 発行された LIFF ID を `cdk.json` の `liff_id` に設定し、もう一度 `cdk deploy` する。
+   LIFF ID はデプロイ時に `config.json` として画面に配置されます。
+4. `https://liff.line.me/<LIFF ID>` をリッチメニューなどに設定すると、LINE から明細画面を開けます。
+   `?year=2025` を付けるとその年を開きます（付けない場合、1〜3月は前年、それ以外は今年）。
