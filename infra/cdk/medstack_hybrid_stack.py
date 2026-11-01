@@ -32,6 +32,8 @@ class MedstackHybridStack(Stack):
         docai_processor_id = str(self.node.try_get_context("docai_processor_id") or "")
         receipt_prefix = str(self.node.try_get_context("receipt_prefix") or "raw")
         config_path = str(self.node.try_get_context("config_path") or "config.yaml")
+        # LIFF の ID トークン検証に使う LINE Login チャネル ID（Messaging API チャネルと同じプロバイダーに作る）
+        line_login_channel_id = str(self.node.try_get_context("line_login_channel_id") or "")
         app_secret = (
             secretsmanager.Secret.from_secret_name_v2(
                 self,
@@ -312,6 +314,35 @@ class MedstackHybridStack(Stack):
             app_secret.grant_read(ingress_fn)
             app_secret.grant_read(worker_fn)
 
+        # LIFF 画面向けの明細 API。OCR 用の依存は不要なので Layer なしの軽量な Lambda にする。
+        ledger_api_fn = lambda_.Function(
+            self,
+            "LedgerApiFunction",
+            function_name=f"{prefix}-ledger-api",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="app.lambda_handlers.api_handler.lambda_handler",
+            code=lambda_.Code.from_asset(lambda_asset_path, exclude=lambda_asset_excludes),
+            timeout=Duration.seconds(15),
+            memory_size=512,
+            environment={
+                "DDB_TABLE_PREFIX": prefix,
+                "DDB_RECEIPTS_TABLE": receipts_table.table_name,
+                "DDB_FIELDS_TABLE": receipt_fields_table.table_name,
+                "DDB_SESSIONS_TABLE": sessions_table.table_name,
+                "DDB_AGGREGATE_TABLE": aggregate_entries_table.table_name,
+                "DDB_FAMILY_TABLE": family_registry_table.table_name,
+                "RECEIPT_BUCKET": receipt_bucket.bucket_name,
+                "LINE_LOGIN_CHANNEL_ID": line_login_channel_id,
+            },
+        )
+        # 明細の削除で OCR 由来の領収書（項目値・セッション・原本画像）もまとめて消すため、それらへの書き込み権限を付ける
+        receipts_table.grant_read_write_data(ledger_api_fn)
+        receipt_fields_table.grant_read_write_data(ledger_api_fn)
+        sessions_table.grant_read_write_data(ledger_api_fn)
+        aggregate_entries_table.grant_read_write_data(ledger_api_fn)
+        family_registry_table.grant_read_data(ledger_api_fn)
+        receipt_bucket.grant_delete(ledger_api_fn)
+
         line_webhook_api = apigwv2.HttpApi(
             self,
             "LineWebhookApi",
@@ -326,7 +357,23 @@ class MedstackHybridStack(Stack):
             ),
         )
 
+        ledger_api_integration = apigwv2_integrations.HttpLambdaIntegration(
+            "LedgerApiIntegration",
+            ledger_api_fn,
+        )
+        line_webhook_api.add_routes(
+            path="/api/{proxy+}",
+            methods=[
+                apigwv2.HttpMethod.GET,
+                apigwv2.HttpMethod.POST,
+                apigwv2.HttpMethod.PATCH,
+                apigwv2.HttpMethod.DELETE,
+            ],
+            integration=ledger_api_integration,
+        )
+
         CfnOutput(self, "LineWebhookUrl", value=f"{line_webhook_api.api_endpoint}{line_webhook_path}")
+        CfnOutput(self, "LedgerApiBaseUrl", value=f"{line_webhook_api.api_endpoint}/api")
         CfnOutput(self, "LineEventsQueueUrl", value=line_events_queue.queue_url)
         CfnOutput(self, "ReceiptBucketName", value=receipt_bucket.bucket_name)
         CfnOutput(self, "FamilyRegistryTableName", value=family_registry_table.table_name)

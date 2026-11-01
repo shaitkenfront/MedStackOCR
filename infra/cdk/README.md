@@ -27,6 +27,7 @@ pip install -r requirements.txt
 - `docai_project_id`
 - `docai_location`
 - `docai_processor_id`
+- `line_login_channel_id`（LIFF の明細画面を使う場合。後述）
 
 Secrets Manager のシークレット文字列(JSON)例:
 ```json
@@ -79,3 +80,23 @@ OCR利用制限カウンタは `OcrUsageGuardTableName` 出力の DynamoDB テ�
 - `docai_project_id`: `messtackocr`
 - `docai_location`: `us`
 - `docai_processor_id`: `54aaada2a941413`
+
+## 5. 明細画面（LIFF）用 API
+
+`ledger-api` Lambda が `/api/*` を処理します（同じ HTTP API に同居）。デプロイ後の `LedgerApiBaseUrl` 出力がベース URL です。
+
+| メソッド | パス | 内容 |
+| --- | --- | --- |
+| GET | `/api/meta` | 年の一覧・医療費の区分・登録済みの家族 |
+| GET | `/api/entries?year=YYYY` | 明細一覧と集計 |
+| POST | `/api/entries` | 手入力の明細を追加（交通費など） |
+| GET / PATCH / DELETE | `/api/entries/{entry_id}` | 明細の取得・修正・削除（OCR 由来なら原本画像も削除） |
+| GET | `/api/checks?year=YYYY` | 抜け漏れチェック |
+
+認証は LIFF の ID トークン（`Authorization: Bearer <liff.getIDToken()>`）を LINE の検証 API で確認します。
+
+### LINE Login チャネルの準備
+1. LINE Developers Console で、Messaging API チャネルと**同じプロバイダー**に LINE Login チャネルを作成する。
+   別のプロバイダーだとユーザー ID が一致せず、LINE で登録した明細が画面に表示されません。
+2. チャネル基本設定の「チャネル ID」を `cdk.json` の `line_login_channel_id` に設定する（非機密値）。
+3. 未設定のままデプロイすると、API はすべてのリクエストを 401 で拒否します。
