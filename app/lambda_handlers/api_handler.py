@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from inbox.dynamo_repository import DynamoInboxRepository
+from inbox.ocr_archive import archive_path_for
 from ledger.api import ApiRequest, LedgerApi
 from ledger.auth import LineIdTokenVerifier
 from ledger.service import LedgerService
@@ -72,6 +73,9 @@ def build_api_from_env(env: Any, *, dynamodb_resource: Any | None = None, s3_cli
             logger.warning("skip deleting receipt image outside the receipt bucket")
             return
         s3_client.delete_object(Bucket=target_bucket, Key=key)
+        # 画像と一緒に保存している OCR の読み取り結果も消す
+        _, archive_key = _parse_s3_uri(archive_path_for(image_path))
+        s3_client.delete_object(Bucket=target_bucket, Key=archive_key)
 
     def sign_image_url(image_path: str, expires_in: int) -> str | None:
         target_bucket, key = _parse_s3_uri(image_path)

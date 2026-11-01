@@ -129,6 +129,18 @@ button:disabled { opacity: .5; cursor: default; }
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px;
 }
 .provider-row.suspicious { border-left: 4px solid var(--warning); }
+.provider-item { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: stretch; }
+.provider-edit { font-size: 13px; white-space: nowrap; }
+.bulk-option {
+  display: flex; gap: 8px; align-items: flex-start; font-size: 13px; padding: 8px;
+  background: var(--warning-bg); border-radius: 8px;
+}
+.bulk-option input { width: auto; margin-top: 3px; }
+.merge-list { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; margin: 0; }
+.merge-list legend { font-size: 13px; color: var(--muted); padding: 0 4px; }
+.merge-option { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 14px; }
+.merge-option input { width: auto; }
+.merge-option small { color: var(--muted); }
 .provider-row .variant-stat { grid-column: 1 / -1; }
 
 .suggestion {

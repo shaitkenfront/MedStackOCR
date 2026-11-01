@@ -18,7 +18,14 @@ class ApiHandlerTest(unittest.TestCase):
         api.image_deleter("s3://receipts/raw/2026/R1.jpg")
         api.image_deleter("s3://other-bucket/R2.jpg")
         api.image_deleter("/tmp/local.jpg")
-        s3.delete_object.assert_called_once_with(Bucket="receipts", Key="raw/2026/R1.jpg")
+        # 画像と、隣に保存している OCR の読み取り結果だけを消す
+        self.assertEqual(
+            s3.delete_object.call_args_list,
+            [
+                mock.call(Bucket="receipts", Key="raw/2026/R1.jpg"),
+                mock.call(Bucket="receipts", Key="raw/2026/R1.jpg.ocr.json"),
+            ],
+        )
 
     def test_channel_id_comes_from_env(self) -> None:
         api = build_api_from_env({"LINE_LOGIN_CHANNEL_ID": " 1650 "}, dynamodb_resource=mock.Mock(), s3_client=mock.Mock())

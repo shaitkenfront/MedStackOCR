@@ -104,6 +104,10 @@
         </span>
         <small class="field-error" data-error-for="provider_name"></small>
       </label>
+      <label class="bulk-option" id="bulk-rename-row" hidden>
+        <input type="checkbox" id="bulk-rename">
+        <span id="bulk-rename-label"></span>
+      </label>
       <label class="field">
         <span>医療を受けた人</span>
         <input type="text" name="family_member_name" maxlength="50" list="family-options" required autocomplete="off">
@@ -148,6 +152,31 @@
         <span class="spacer"></span>
         <button type="button" id="cancel-button">キャンセル</button>
         <button type="submit" class="primary" id="save-button">保存</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="rename-dialog" aria-labelledby="rename-title">
+    <form id="rename-form" method="dialog" novalidate>
+      <h2 id="rename-title">支払先の名前をまとめて直す</h2>
+      <p class="dialog-hint" id="rename-hint"></p>
+      <label class="field">
+        <span>正しい名前</span>
+        <input type="text" name="to_name" maxlength="100" list="provider-options" autocomplete="off" required>
+      </label>
+      <fieldset class="merge-list" id="rename-merge-fieldset">
+        <legend>ほかの名前もこの名前にまとめる（任意）</legend>
+        <div id="rename-merge-options"></div>
+      </fieldset>
+      <div class="receipt-image" id="rename-image-area" hidden>
+        <button type="button" id="rename-image-button">この支払先の領収書を見る</button>
+        <p class="field-help" id="rename-image-message" role="status"></p>
+        <img id="rename-image" alt="LINEで送った領収書の画像" hidden>
+      </div>
+      <p class="form-error" id="rename-error" role="alert"></p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="rename-cancel">キャンセル</button>
+        <button type="submit" class="primary" id="rename-save">まとめて変更</button>
       </div>
     </form>
   </dialog>

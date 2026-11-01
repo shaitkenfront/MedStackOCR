@@ -50,6 +50,7 @@ class ReceiptExtractionPipeline:
         household_id: str | None,
         ocr_engine: str,
         family_registry_override: dict[str, Any] | None = None,
+        known_provider_names: list[str] | None = None,
     ) -> ExtractionResult:
         adapter = create_ocr_adapter(ocr_engine, self.config)
         raw = adapter.run(image_path)
@@ -76,7 +77,10 @@ class ReceiptExtractionPipeline:
             FieldName.PAYMENT_AMOUNT: [],
             FieldName.FAMILY_MEMBER_NAME: [],
         }
-        self._merge_candidate_pool(candidate_pool, self.facility_extractor.extract(document_type, lines))
+        self._merge_candidate_pool(
+            candidate_pool,
+            self.facility_extractor.extract(document_type, lines, known_names=known_provider_names),
+        )
         candidate_pool[FieldName.PAYMENT_DATE].extend(self.date_extractor.extract(lines))
         candidate_pool[FieldName.PAYMENT_AMOUNT].extend(
             self.amount_extractor.extract(lines, ocr_engine=raw.engine)

@@ -31,6 +31,7 @@
     issuesOnly: false,
     focusGroupId: null,
     editing: null, // { entry, initial } 新規追加なら entry は null
+    renaming: null, // { name, sample } 支払先の名前をまとめて直すダイアログ
   };
 
   const $ = (id) => document.getElementById(id);
@@ -195,11 +196,24 @@
     });
     $("receipt-image-button").addEventListener("click", showReceiptImage);
     const providerInput = $("entry-form").elements.provider_name;
-    providerInput.addEventListener("input", updateProviderSuggestion);
-    providerInput.addEventListener("change", updateProviderSuggestion);
+    const onProviderInput = () => {
+      updateProviderSuggestion();
+      updateBulkRenameOption();
+    };
+    providerInput.addEventListener("input", onProviderInput);
+    providerInput.addEventListener("change", onProviderInput);
     $("provider-suggestion-apply").addEventListener("click", () => {
       providerInput.value = $("provider-suggestion").dataset.name || providerInput.value;
-      updateProviderSuggestion();
+      onProviderInput();
+    });
+    $("rename-cancel").addEventListener("click", () => $("rename-dialog").close());
+    $("rename-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitRename();
+    });
+    $("rename-image-button").addEventListener("click", () => {
+      const sample = state.renaming && state.renaming.sample;
+      if (sample) loadReceiptImage(sample, $("rename-image"), $("rename-image-message"), $("rename-image-button"));
     });
     $("member-filter").addEventListener("change", (event) => {
       state.memberFilter = event.target.value;
@@ -395,9 +409,7 @@
     $("group-list").replaceChildren(...groups.map(renderGroup));
     $("provider-list").replaceChildren(
       ...state.providers.map((provider) =>
-        el(
-          "li",
-          {},
+        el("li", { className: "provider-item" }, [
           el(
             "button",
             {
@@ -417,8 +429,15 @@
                 text: `${provider.count}件${provider.suspicious_reason ? `　⚠ ${provider.suspicious_reason}` : ""}`,
               }),
             ]
-          )
-        )
+          ),
+          el("button", {
+            type: "button",
+            className: "provider-edit",
+            text: "名前を直す",
+            "aria-label": `「${provider.name}」の名前をまとめて直す`,
+            onclick: () => openRenameDialog(provider.name),
+          }),
+        ])
       )
     );
     if (state.focusGroupId) {
@@ -584,13 +603,14 @@
   }
 
   // ---------- 領収書の画像 ----------
-  async function showReceiptImage() {
+  function showReceiptImage() {
     const { entry } = state.editing || {};
-    if (!entry) return;
-    const image = $("receipt-image");
-    const message = $("receipt-image-message");
+    if (entry) loadReceiptImage(entry, $("receipt-image"), $("receipt-image-message"), $("receipt-image-button"));
+  }
+
+  async function loadReceiptImage(entry, image, message, button) {
     message.textContent = "画像を読み込んでいます…";
-    $("receipt-image-button").disabled = true;
+    button.disabled = true;
     try {
       const body = await api("GET", `/entries/${encodeURIComponent(entry.entry_id)}/image`);
       image.onload = () => {
@@ -599,14 +619,104 @@
       image.onerror = () => {
         image.hidden = true;
         message.textContent = "画像を表示できませんでした。もう一度お試しください。";
-        $("receipt-image-button").disabled = false;
+        button.disabled = false;
       };
       image.src = body.url;
       image.hidden = false;
     } catch (error) {
       if (error.status !== 401) message.textContent = error.message;
-      $("receipt-image-button").disabled = false;
+      button.disabled = false;
     }
+  }
+
+  function resetImage(image, message, button) {
+    image.hidden = true;
+    image.removeAttribute("src");
+    message.textContent = "";
+    button.disabled = false;
+  }
+
+  // ---------- 支払先の名前をまとめて直す ----------
+  function entriesWithProvider(name) {
+    return state.entries.filter((entry) => entry.provider_name === name);
+  }
+
+  function openRenameDialog(name) {
+    const form = $("rename-form");
+    state.renaming = { name };
+    form.elements.to_name.value = name;
+    $("rename-error").textContent = "";
+    const count = entriesWithProvider(name).length;
+    $("rename-hint").textContent =
+      `「${name}」の明細（この年 ${count}件）を、入力した名前に変更します。` +
+      "ほかの年の同じ名前の明細も変更され、次回からLINEで読み取った同じ名前も自動で直します。";
+
+    const others = state.providers.filter((provider) => provider.name !== name);
+    $("rename-merge-fieldset").hidden = others.length === 0;
+    $("rename-merge-options").replaceChildren(
+      ...others.map((provider, index) =>
+        el("label", { className: "merge-option", for: `merge-${index}` }, [
+          el("input", { type: "checkbox", id: `merge-${index}`, "data-merge": provider.name }),
+          el("span", { text: provider.name }),
+          el("small", { text: `${provider.count}件` }),
+        ])
+      )
+    );
+
+    const sample = entriesWithProvider(name).find((entry) => entry.source === "ocr");
+    state.renaming.sample = sample || null;
+    $("rename-image-area").hidden = !sample;
+    resetImage($("rename-image"), $("rename-image-message"), $("rename-image-button"));
+    $("rename-save").disabled = false;
+    $("rename-dialog").showModal();
+  }
+
+  async function submitRename() {
+    const { name } = state.renaming || {};
+    if (!name) return;
+    const target = $("rename-form").elements.to_name.value.trim();
+    const merged = [...document.querySelectorAll("#rename-merge-options input[data-merge]:checked")].map(
+      (input) => input.dataset.merge
+    );
+    const fromNames = [name, ...merged].filter((value, index, list) => value !== target && list.indexOf(value) === index);
+    if (!target) {
+      $("rename-error").textContent = "正しい名前を入力してください。";
+      return;
+    }
+    if (!fromNames.length) {
+      $("rename-error").textContent = "名前が変わっていません。";
+      return;
+    }
+    if (!window.confirm(`「${fromNames.join("」「")}」の明細（ほかの年も含む）を「${target}」に変更します。よろしいですか？`)) return;
+    $("rename-save").disabled = true;
+    try {
+      const body = await api("POST", "/providers/rename", { from_names: fromNames, to_name: target });
+      $("rename-dialog").close();
+      await refreshAfterChange();
+      setStatus(`${body.updated}件の明細を「${target}」に変更しました。`);
+    } catch (error) {
+      if (error.status !== 401) $("rename-error").textContent = errorText(error);
+    } finally {
+      $("rename-save").disabled = false;
+    }
+  }
+
+  // 編集画面で支払先の名前を変えたとき、同じ名前のほかの明細もまとめて直せるようにする
+  function updateBulkRenameOption() {
+    const { entry, initial } = state.editing || {};
+    const row = $("bulk-rename-row");
+    const value = $("entry-form").elements.provider_name.value.trim();
+    const oldName = initial ? initial.provider_name : "";
+    if (!entry || !oldName || !value || value === oldName) {
+      row.hidden = true;
+      return;
+    }
+    const count = entriesWithProvider(oldName).length;
+    const wasHidden = row.hidden;
+    $("bulk-rename-label").textContent =
+      `「${oldName}」の明細をすべてこの名前に変更する（この年 ${count}件。ほかの年の同じ名前の明細と、次回からの読み取り結果にも反映）`;
+    if (wasHidden) $("bulk-rename").checked = count >= 2;
+    row.hidden = false;
   }
 
   // ---------- 編集ダイアログ ----------
@@ -652,10 +762,9 @@
     $("delete-button").hidden = !entry;
     $("save-button").disabled = false;
     $("receipt-image-area").hidden = !(entry && entry.source === "ocr");
-    $("receipt-image-button").disabled = false;
-    $("receipt-image-message").textContent = "";
-    $("receipt-image").hidden = true;
-    $("receipt-image").removeAttribute("src");
+    resetImage($("receipt-image"), $("receipt-image-message"), $("receipt-image-button"));
+    $("bulk-rename-row").hidden = true;
+    $("bulk-rename").checked = false;
     updateProviderSuggestion();
     $("entry-dialog").showModal();
   }
@@ -704,12 +813,25 @@
       return;
     }
     clearErrors();
+    const bulkRename = Boolean(entry && changes.provider_name !== undefined && !$("bulk-rename-row").hidden && $("bulk-rename").checked);
     $("save-button").disabled = true;
     try {
-      if (entry) await api("PATCH", `/entries/${encodeURIComponent(entry.entry_id)}`, changes);
-      else await api("POST", "/entries", changes);
+      let renamed = null;
+      if (bulkRename) {
+        const { provider_name: newName, ...rest } = changes;
+        if (Object.keys(rest).length) await api("PATCH", `/entries/${encodeURIComponent(entry.entry_id)}`, rest);
+        renamed = await api("POST", "/providers/rename", {
+          from_names: [state.editing.initial.provider_name],
+          to_name: newName.trim(),
+        });
+      } else if (entry) {
+        await api("PATCH", `/entries/${encodeURIComponent(entry.entry_id)}`, changes);
+      } else {
+        await api("POST", "/entries", changes);
+      }
       $("entry-dialog").close();
       await refreshAfterChange();
+      if (renamed) setStatus(`${renamed.updated}件の明細の支払先を変更しました。`);
     } catch (error) {
       if (error.status !== 401) showErrors(error);
     } finally {
