@@ -39,7 +39,8 @@ class FacilityExtractorTest(unittest.TestCase):
         candidates = extractor.extract(DocumentType.CLINIC_OR_HOSPITAL, lines)
         payer_candidates = candidates[FieldName.PAYER_FACILITY_NAME]
         self.assertTrue(payer_candidates)
-        self.assertEqual(payer_candidates[0].value_normalized, "医療法人 サンプルクリニック")
+        # 空白で区切られた法人格は外し、施設名だけを明細に使う
+        self.assertEqual(payer_candidates[0].value_normalized, "サンプルクリニック")
 
     def test_pharmacy_payer_ignores_document_title(self) -> None:
         extractor = FacilityExtractor()
@@ -105,7 +106,8 @@ class FacilityExtractorTest(unittest.TestCase):
         candidates = extractor.extract(DocumentType.CLINIC_OR_HOSPITAL, lines)
         payer_candidates = candidates[FieldName.PAYER_FACILITY_NAME]
         self.assertTrue(payer_candidates)
-        self.assertEqual(payer_candidates[0].value_normalized, "請求元:サンプルクリニック 本院")
+        # 「請求元:」のようなラベルは除き、名前の部分だけを明細に使う
+        self.assertEqual(payer_candidates[0].value_normalized, "サンプルクリニック 本院")
 
 
 if __name__ == "__main__":

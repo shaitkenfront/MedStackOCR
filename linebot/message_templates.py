@@ -209,10 +209,59 @@ def build_help_message() -> list[dict[str, Any]]:
                 "- 領収書画像を送信\n"
                 "- 必要なら候補を選んで修正\n"
                 "- コマンド: 今年の医療費 / 今月の医療費 / 未確認 / 取り消し / ヘルプ\n"
+                "- 明細: 一覧で確認・修正・手入力（交通費など）\n"
+                "- 申告資料: 確定申告用の医療費集計フォーム（Excel）を作成\n"
                 "- 短時間の連続送信時は受付を一時制限します"
             ),
         }
     ]
+
+
+def build_ledger_link_message(url: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "template",
+            "altText": f"明細の確認・修正はこちら: {url}",
+            "template": {
+                "type": "buttons",
+                "text": "明細の確認・修正、交通費などの手入力ができます。",
+                "actions": [{"type": "uri", "label": "明細を開く", "uri": url}],
+            },
+        }
+    ]
+
+
+def build_tax_form_message(
+    *,
+    year: int,
+    included_count: int,
+    net_amount_yen: int,
+    excluded_count: int,
+    url: str,
+) -> list[dict[str, Any]]:
+    lines = [
+        f"{year}年分の確定申告用の資料（国税庁の医療費集計フォーム）を作成できます。",
+        f"資料に載せる明細: {included_count}件（差引 {net_amount_yen:,}円）",
+    ]
+    if excluded_count:
+        lines.append(f"未確定や要修正の明細 {excluded_count}件は載せていません。画面で確認してください。")
+    lines.append("※セルフメディケーション税制を使う場合は、このフォームは使えません。")
+    return [
+        {"type": "text", "text": "\n".join(lines)},
+        {
+            "type": "template",
+            "altText": f"申告用の資料を作る: {url}",
+            "template": {
+                "type": "buttons",
+                "text": f"{year}年分の資料を作成・ダウンロードします。",
+                "actions": [{"type": "uri", "label": "申告用の資料を作る", "uri": url}],
+            },
+        },
+    ]
+
+
+def build_ledger_screen_unavailable_message() -> list[dict[str, Any]]:
+    return [{"type": "text", "text": "明細の画面はまだ準備中です。しばらくしてからお試しください。"}]
 
 
 def build_unknown_message() -> list[dict[str, Any]]:

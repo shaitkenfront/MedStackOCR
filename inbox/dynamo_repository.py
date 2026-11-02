@@ -12,6 +12,7 @@ from core.enums import FieldName
 from core.models import Candidate, ExtractionResult
 from inbox.models import ConversationSession
 from inbox.repository_interface import InboxRepositoryProtocol
+from ledger.models import SOURCE_OCR, infer_medical_category
 
 try:
     import boto3  # type: ignore
@@ -285,20 +286,20 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
             sort_key = f"{date_prefix}#{receipt_id}"
             created_at = now
 
-        self._aggregate_table.put_item(
-            Item={
-                "line_user_id": partition_key,
-                "service_date_receipt": sort_key,
-                "receipt_id": receipt_id,
-                "service_date": service_date,
-                "provider_name": provider,
-                "amount_yen": amount,
-                "family_member_name": family_name,
-                "status": status,
-                "created_at": created_at,
-                "updated_at": now,
-            }
-        )
+        item: dict[str, Any] = {
+            "line_user_id": partition_key,
+            "service_date_receipt": sort_key,
+            "receipt_id": receipt_id,
+            "service_date": service_date,
+            "provider_name": provider,
+            "amount_yen": amount,
+            "family_member_name": family_name,
+            "status": status,
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        item.update(_ledger_only_attributes(existing, provider))
+        self._aggregate_table.put_item(Item=item)
 
     def set_aggregate_status(self, receipt_id: str, status: str) -> None:
         existing = self._find_aggregate_by_receipt(receipt_id)
@@ -844,6 +845,156 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
 
         return image_path
 
+    def list_ledger_rows(self, line_user_id: str) -> list[dict[str, Any]]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return []
+        return [_plain_ledger_row(row) for row in self._query_aggregate_entries(line_user_id=user_id)]
+
+    def get_ledger_row(self, line_user_id: str, entry_id: str) -> dict[str, Any] | None:
+        row = self._find_owned_aggregate(line_user_id, entry_id)
+        return _plain_ledger_row(row) if row is not None else None
+
+    def save_ledger_row(self, line_user_id: str, entry_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        user_id = str(line_user_id or "").strip()
+        eid = str(entry_id or "").strip()
+        if not user_id or not eid:
+            raise ValueError("line_user_id and entry_id are required")
+
+        existing = self._find_aggregate_by_receipt(eid)
+        if existing is not None and str(existing.get("line_user_id", "")) != user_id:
+            raise PermissionError("entry belongs to another user")
+
+        now = _utc_now()
+        item: dict[str, Any] = dict(existing or {})
+        for key, value in values.items():
+            if key in _LEDGER_WRITABLE_ATTRIBUTES:
+                item[key] = value
+        item["line_user_id"] = user_id
+        item["receipt_id"] = eid
+        item["created_at"] = str(item.get("created_at") or now)
+        item["updated_at"] = now
+        item.setdefault("status", "confirmed")
+        date_prefix = _to_date_text(item.get("service_date")) or str(item["created_at"])[:10]
+        item["service_date_receipt"] = f"{date_prefix}#{eid}"
+
+        old_sort_key = str(existing["service_date_receipt"]) if existing is not None else None
+        if old_sort_key is None or old_sort_key == item["service_date_receipt"]:
+            self._aggregate_table.put_item(Item=item)
+        else:
+            # 日付はソートキーに含まれるため、日付の変更は旧明細の削除と新明細の追加を1トランザクションで行う。
+            # resource の meta.client は型変換が効くので、値はネイティブ型のまま渡す（consume_ocr_quota と同じ）。
+            self._ddb.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self._aggregate_table.name,
+                            "Item": item,
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self._aggregate_table.name,
+                            "Key": {"line_user_id": user_id, "service_date_receipt": old_sort_key},
+                        }
+                    },
+                ]
+            )
+        return _plain_ledger_row(item)
+
+    def delete_ledger_row(self, line_user_id: str, entry_id: str) -> bool:
+        row = self._find_owned_aggregate(line_user_id, entry_id)
+        if row is None:
+            return False
+        self._aggregate_table.delete_item(
+            Key={
+                "line_user_id": row["line_user_id"],
+                "service_date_receipt": row["service_date_receipt"],
+            }
+        )
+        return True
+
+    # --- 支払先の名寄せ（学習ルールテーブルに rule_key の接頭辞を分けて保存） ---
+    def list_provider_distinct_pair_keys(self, line_user_id: str) -> list[str]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return []
+        rows = self._query_learning_items(user_id, _PROVIDER_DISTINCT_PREFIX, projection="rule_key")
+        return [str(row["rule_key"])[len(_PROVIDER_DISTINCT_PREFIX):] for row in rows]
+
+    def add_provider_distinct_pairs(self, line_user_id: str, pairs: list[tuple[str, str, str]]) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not pairs:
+            return
+        now = _utc_now()
+        with self._learning_table.batch_writer(overwrite_by_pkeys=["line_user_id", "rule_key"]) as batch:
+            for key, name_a, name_b in pairs:
+                batch.put_item(
+                    Item={
+                        "line_user_id": user_id,
+                        "rule_key": f"{_PROVIDER_DISTINCT_PREFIX}{key}",
+                        "name_a": name_a,
+                        "name_b": name_b,
+                        "created_at": now,
+                    }
+                )
+
+    def upsert_provider_alias(self, line_user_id: str, alias_key: str, variant_name: str, canonical_name: str) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not alias_key or not canonical_name:
+            return
+        self._learning_table.put_item(
+            Item={
+                "line_user_id": user_id,
+                "rule_key": f"{_PROVIDER_ALIAS_PREFIX}{alias_key}",
+                "variant_name": variant_name,
+                "canonical_name": canonical_name,
+                "updated_at": _utc_now(),
+            }
+        )
+
+    def get_provider_alias(self, line_user_id: str, alias_key: str) -> str | None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not alias_key:
+            return None
+        item = self._learning_table.get_item(
+            Key={"line_user_id": user_id, "rule_key": f"{_PROVIDER_ALIAS_PREFIX}{alias_key}"}
+        ).get("Item")
+        name = str((item or {}).get("canonical_name") or "").strip()
+        return name or None
+
+    def get_receipt_image_path(self, line_user_id: str, receipt_id: str) -> str | None:
+        rid = str(receipt_id or "").strip()
+        if not rid:
+            return None
+        row = self._receipts_table.get_item(Key={"receipt_id": rid}).get("Item")
+        if row is None or str(row.get("line_user_id", "")) != str(line_user_id or "").strip():
+            return None
+        return str(row.get("image_path") or "").strip() or None
+
+    def _query_learning_items(self, line_user_id: str, prefix: str, *, projection: str) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("line_user_id").eq(line_user_id) & Key("rule_key").begins_with(prefix),
+            "ProjectionExpression": projection,
+        }
+        items: list[dict[str, Any]] = []
+        while True:
+            response = self._learning_table.query(**kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                return items
+            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+    def _find_owned_aggregate(self, line_user_id: str, entry_id: str) -> dict[str, Any] | None:
+        user_id = str(line_user_id or "").strip()
+        eid = str(entry_id or "").strip()
+        if not user_id or not eid:
+            return None
+        row = self._find_aggregate_by_receipt(eid)
+        if row is None or str(row.get("line_user_id", "")) != user_id:
+            return None
+        return row
+
     def _query_aggregate_entries(self, *, line_user_id: str, prefix: str | None = None) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {
             "KeyConditionExpression": Key("line_user_id").eq(line_user_id),
@@ -1101,6 +1252,48 @@ class DynamoInboxRepository(InboxRepositoryProtocol):
         )
         items = response.get("Items", [])
         return items[0] if items else None
+
+
+_PROVIDER_DISTINCT_PREFIX = "PROVIDER_DISTINCT#"
+_PROVIDER_ALIAS_PREFIX = "PROVIDER_ALIAS#"
+
+_LEDGER_WRITABLE_ATTRIBUTES = frozenset(
+    {
+        "service_date",
+        "provider_name",
+        "family_member_name",
+        "amount_yen",
+        "reimbursed_yen",
+        "medical_category",
+        "note",
+        "status",
+        "entry_source",
+    }
+)
+
+
+def _ledger_only_attributes(existing: dict[str, Any] | None, provider: str | None) -> dict[str, Any]:
+    """OCR 側の更新で、明細画面で入力した区分・補填額・メモを消さないための引き継ぎ値。"""
+    previous = existing or {}
+    attributes: dict[str, Any] = {
+        "entry_source": previous.get("entry_source") or SOURCE_OCR,
+        "medical_category": previous.get("medical_category") or infer_medical_category(provider),
+    }
+    if previous.get("reimbursed_yen") is not None:
+        attributes["reimbursed_yen"] = previous["reimbursed_yen"]
+    if previous.get("note") is not None:
+        attributes["note"] = previous["note"]
+    return attributes
+
+
+def _plain_ledger_row(row: dict[str, Any]) -> dict[str, Any]:
+    plain: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, Decimal):
+            plain[key] = int(value) if value == value.to_integral_value() else float(value)
+        else:
+            plain[key] = value
+    return plain
 
 
 def _summarize(rows: list[dict[str, Any]], statuses: set[str]) -> tuple[int, int]:

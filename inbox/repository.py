@@ -13,6 +13,25 @@ from uuid import uuid4
 from core.enums import FieldName
 from core.models import Candidate, ExtractionResult
 from inbox.models import ConversationSession
+from ledger.models import SOURCE_OCR, infer_medical_category
+
+_LEDGER_WRITABLE_COLUMNS = frozenset(
+    {
+        "service_date",
+        "provider_name",
+        "family_member_name",
+        "amount_yen",
+        "reimbursed_yen",
+        "medical_category",
+        "note",
+        "status",
+        "entry_source",
+    }
+)
+_LEDGER_COLUMNS = (
+    "receipt_id, line_user_id, service_date, provider_name, amount_yen, family_member_name, status, "
+    "created_at, updated_at, entry_source, medical_category, reimbursed_yen, note"
+)
 
 
 def _utc_now() -> str:
@@ -145,6 +164,30 @@ class InboxRepository:
                 """
             )
             self._ensure_column_exists(conn, "receipts", "duplicate_key", "TEXT")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS provider_distinct_pairs (
+                    line_user_id TEXT NOT NULL,
+                    pair_key TEXT NOT NULL,
+                    name_a TEXT,
+                    name_b TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (line_user_id, pair_key)
+                );
+                CREATE TABLE IF NOT EXISTS provider_aliases (
+                    line_user_id TEXT NOT NULL,
+                    alias_key TEXT NOT NULL,
+                    variant_name TEXT,
+                    canonical_name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (line_user_id, alias_key)
+                );
+                """
+            )
+            self._ensure_column_exists(conn, "aggregate_entries", "entry_source", "TEXT")
+            self._ensure_column_exists(conn, "aggregate_entries", "medical_category", "TEXT")
+            self._ensure_column_exists(conn, "aggregate_entries", "reimbursed_yen", "INTEGER")
+            self._ensure_column_exists(conn, "aggregate_entries", "note", "TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_receipts_user_hash ON receipts(line_user_id, image_sha256)"
             )
@@ -392,18 +435,27 @@ class InboxRepository:
 
         with self._connect() as conn:
             existing = conn.execute(
-                "SELECT entry_id, created_at FROM aggregate_entries WHERE receipt_id = ?",
+                """
+                SELECT entry_id, created_at, entry_source, medical_category, reimbursed_yen, note
+                FROM aggregate_entries WHERE receipt_id = ?
+                """,
                 (receipt_id,),
             ).fetchone()
             entry_id = existing["entry_id"] if existing else str(uuid4())
             created_at = existing["created_at"] if existing else now
+            # 明細画面で入力した区分・補填額・メモは OCR 側の更新で消さない
+            entry_source = (existing["entry_source"] if existing else None) or SOURCE_OCR
+            medical_category = (existing["medical_category"] if existing else None) or infer_medical_category(provider)
+            reimbursed_yen = existing["reimbursed_yen"] if existing else None
+            note = existing["note"] if existing else None
             conn.execute(
                 """
                 INSERT OR REPLACE INTO aggregate_entries(
                     entry_id, receipt_id, line_user_id, service_date,
                     provider_name, amount_yen, family_member_name, status,
-                    created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at,
+                    entry_source, medical_category, reimbursed_yen, note
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry_id,
@@ -416,6 +468,10 @@ class InboxRepository:
                     status,
                     created_at,
                     now,
+                    entry_source,
+                    medical_category,
+                    reimbursed_yen,
+                    note,
                 ),
             )
             conn.commit()
@@ -682,6 +738,8 @@ class InboxRepository:
             conn.execute("DELETE FROM family_registry_members WHERE line_user_id = ?", (user_id,))
             conn.execute("DELETE FROM family_registry_profiles WHERE line_user_id = ?", (user_id,))
             conn.execute("DELETE FROM correction_rules WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM provider_distinct_pairs WHERE line_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM provider_aliases WHERE line_user_id = ?", (user_id,))
             conn.execute("DELETE FROM ocr_usage_guard WHERE scope_key = ?", (_ocr_guard_scope_user(user_id),))
             conn.commit()
 
@@ -934,6 +992,134 @@ class InboxRepository:
                     )
             conn.commit()
         return True, None
+
+    def list_ledger_rows(self, line_user_id: str) -> list[dict[str, Any]]:
+        user_id = str(line_user_id or "").strip()
+        if not user_id:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_LEDGER_COLUMNS} FROM aggregate_entries WHERE line_user_id = ? ORDER BY service_date, created_at",
+                (user_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_ledger_row(self, line_user_id: str, entry_id: str) -> dict[str, Any] | None:
+        user_id = str(line_user_id or "").strip()
+        eid = str(entry_id or "").strip()
+        if not user_id or not eid:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {_LEDGER_COLUMNS} FROM aggregate_entries WHERE receipt_id = ? AND line_user_id = ?",
+                (eid, user_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_ledger_row(self, line_user_id: str, entry_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        user_id = str(line_user_id or "").strip()
+        eid = str(entry_id or "").strip()
+        if not user_id or not eid:
+            raise ValueError("line_user_id and entry_id are required")
+        now = _utc_now()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT line_user_id FROM aggregate_entries WHERE receipt_id = ?",
+                (eid,),
+            ).fetchone()
+            if existing is not None and str(existing["line_user_id"]) != user_id:
+                raise PermissionError("entry belongs to another user")
+            updates = {key: value for key, value in values.items() if key in _LEDGER_WRITABLE_COLUMNS}
+            if existing is None:
+                columns = ["entry_id", "receipt_id", "line_user_id", "created_at", "updated_at", *updates.keys()]
+                params = [str(uuid4()), eid, user_id, now, now, *updates.values()]
+                if "status" not in updates:
+                    columns.append("status")
+                    params.append("confirmed")
+                placeholders = ", ".join("?" for _ in columns)
+                conn.execute(
+                    f"INSERT INTO aggregate_entries({', '.join(columns)}) VALUES({placeholders})",
+                    params,
+                )
+            else:
+                assignments = ", ".join(f"{key} = ?" for key in [*updates.keys(), "updated_at"])
+                conn.execute(
+                    f"UPDATE aggregate_entries SET {assignments} WHERE receipt_id = ?",
+                    [*updates.values(), now, eid],
+                )
+            conn.commit()
+        saved = self.get_ledger_row(user_id, eid)
+        if saved is None:  # pragma: no cover - 直前に書き込んでいるため通常は起きない
+            raise RuntimeError("failed to save ledger row")
+        return saved
+
+    def delete_ledger_row(self, line_user_id: str, entry_id: str) -> bool:
+        user_id = str(line_user_id or "").strip()
+        eid = str(entry_id or "").strip()
+        if not user_id or not eid:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM aggregate_entries WHERE receipt_id = ? AND line_user_id = ?",
+                (eid, user_id),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
+
+    def list_provider_distinct_pair_keys(self, line_user_id: str) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT pair_key FROM provider_distinct_pairs WHERE line_user_id = ?",
+                (str(line_user_id or "").strip(),),
+            ).fetchall()
+        return [str(row["pair_key"]) for row in rows]
+
+    def add_provider_distinct_pairs(self, line_user_id: str, pairs: list[tuple[str, str, str]]) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not pairs:
+            return
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO provider_distinct_pairs(line_user_id, pair_key, name_a, name_b, created_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                [(user_id, key, name_a, name_b, now) for key, name_a, name_b in pairs],
+            )
+            conn.commit()
+
+    def upsert_provider_alias(self, line_user_id: str, alias_key: str, variant_name: str, canonical_name: str) -> None:
+        user_id = str(line_user_id or "").strip()
+        if not user_id or not alias_key or not canonical_name:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO provider_aliases(line_user_id, alias_key, variant_name, canonical_name, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (user_id, alias_key, variant_name, canonical_name, _utc_now()),
+            )
+            conn.commit()
+
+    def get_provider_alias(self, line_user_id: str, alias_key: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT canonical_name FROM provider_aliases WHERE line_user_id = ? AND alias_key = ?",
+                (str(line_user_id or "").strip(), alias_key),
+            ).fetchone()
+        return str(row["canonical_name"]) if row is not None else None
+
+    def get_receipt_image_path(self, line_user_id: str, receipt_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT image_path FROM receipts WHERE receipt_id = ? AND line_user_id = ?",
+                (str(receipt_id or "").strip(), str(line_user_id or "").strip()),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["image_path"] or "").strip() or None
 
     def delete_receipt(self, line_user_id: str, receipt_id: str) -> str | None:
         user_id = str(line_user_id or "").strip()

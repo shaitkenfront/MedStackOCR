@@ -16,6 +16,7 @@ from inbox.state_machine import (
     STATE_AWAIT_FIELD_SELECTION,
     STATE_AWAIT_FREE_TEXT,
 )
+from ledger.service import apply_provider_alias
 from linebot import message_templates
 
 EDITABLE_FIELDS = {
@@ -126,7 +127,9 @@ class ConversationService:
         fields = self._fields_from_result(result)
         candidates = self._candidates_from_result(result)
         pending_payload = self._pending_receipt_payload(result=result, metadata=pending_receipt)
-        learning_messages = self._apply_learning_hints(
+        # 支払先の名前を先にそろえてから、支払先をきっかけにした対象者の推定を行う
+        learning_messages = self._apply_provider_aliases(line_user_id=line_user_id, fields=fields)
+        learning_messages += self._apply_learning_hints(
             line_user_id=line_user_id,
             receipt_id=receipt_id,
             fields=fields,
@@ -842,6 +845,26 @@ class ConversationService:
             current_total, _ = self.repository.get_year_summary(line_user_id, current_year)
             totals.append((current_year, current_total))
         return message_templates.build_yearly_cumulative_message(totals)
+
+    def _apply_provider_aliases(self, *, line_user_id: str, fields: dict[str, Any]) -> list[dict[str, Any]]:
+        """明細画面で「そろえた」支払先の名前を、OCR の読み取り結果に反映する。"""
+        replaced: list[str] = []
+        for field_name in (FieldName.PAYER_FACILITY_NAME, FieldName.PRESCRIBING_FACILITY_NAME):
+            canonical = apply_provider_alias(self.repository, line_user_id, fields.get(field_name))
+            if canonical is None:
+                continue
+            fields[field_name] = canonical
+            if canonical not in replaced:
+                replaced.append(canonical)
+        if not replaced:
+            return []
+        names = "、".join(replaced)
+        return [
+            {
+                "type": "text",
+                "text": f"以前そろえた名前に合わせて、医療機関名を「{names}」にしました。違う場合は修正してください。",
+            }
+        ]
 
     def _apply_learning_hints(
         self,

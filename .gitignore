@@ -47,3 +47,5 @@ infra/cdk/cdk.context.json
 infra/cdk/cdk.out/
 infra/cdk/layers/docai/python/**
 !infra/cdk/layers/docai/python/.gitkeep
+# cdk deploy --outputs-file の出力（デプロイのたびに書き換わる環境固有の値）
+infra/cdk/cdk-outputs.json

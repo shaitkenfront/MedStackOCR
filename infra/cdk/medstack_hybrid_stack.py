@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from aws_cdk import (
     CfnOutput,
+    CustomResource,
     Duration,
     RemovalPolicy,
     Stack,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as apigwv2_integrations,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as cloudfront_origins,
     aws_dynamodb as dynamodb,
     aws_kms as kms,
     aws_lambda as lambda_,
     aws_lambda_event_sources as lambda_event_sources,
     aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
     aws_secretsmanager as secretsmanager,
     aws_sqs as sqs,
+    custom_resources as cr,
 )
 from constructs import Construct
 
@@ -32,6 +38,10 @@ class MedstackHybridStack(Stack):
         docai_processor_id = str(self.node.try_get_context("docai_processor_id") or "")
         receipt_prefix = str(self.node.try_get_context("receipt_prefix") or "raw")
         config_path = str(self.node.try_get_context("config_path") or "config.yaml")
+        # LIFF の ID トークン検証に使う LINE Login チャネル ID（Messaging API チャネルと同じプロバイダーに作る）
+        line_login_channel_id = str(self.node.try_get_context("line_login_channel_id") or "")
+        # LIFF アプリの ID。LIFF アプリ作成時にエンドポイント URL（LiffEndpointUrl 出力）が必要なため、初回デプロイ後に設定する
+        liff_id = str(self.node.try_get_context("liff_id") or "")
         app_secret = (
             secretsmanager.Secret.from_secret_name_v2(
                 self,
@@ -75,8 +85,15 @@ class MedstackHybridStack(Stack):
                 s3.LifecycleRule(
                     id="ExpireRawImages",
                     prefix=f"{receipt_prefix}/",
-                    expiration=Duration.days(90),
-                )
+                    # 医療費控除の領収書は申告期限から5年間の保存が必要なため、余裕を見て6年保存する
+                    expiration=Duration.days(365 * 6 + 2),
+                ),
+                # 申告用資料（医療費集計フォーム）の一時保存。ダウンロード用の URL は10分で切れ、ファイルも1日で消す
+                s3.LifecycleRule(
+                    id="ExpireTaxFormExports",
+                    prefix="exports/",
+                    expiration=Duration.days(1),
+                ),
             ],
             removal_policy=RemovalPolicy.RETAIN,
         )
@@ -229,6 +246,7 @@ class MedstackHybridStack(Stack):
             "external/**",
             "tests/**",
             "infra/**",
+            "web/**",
             "cdk.out/**",
             "*.md",
             "PLAN*.md",
@@ -282,6 +300,7 @@ class MedstackHybridStack(Stack):
                 "DOC_AI_LOCATION": docai_location,
                 "DOC_AI_PROCESSOR_ID": docai_processor_id,
                 "TEMPLATE_STORE_PATH": "/tmp/data/templates",
+                "LIFF_ID": liff_id,
                 "OCR_GUARD_ENABLED": "true",
                 "OCR_GUARD_USER_PER_MINUTE": "3",
                 "OCR_GUARD_USER_PER_DAY": "40",
@@ -312,6 +331,41 @@ class MedstackHybridStack(Stack):
             app_secret.grant_read(ingress_fn)
             app_secret.grant_read(worker_fn)
 
+        # LIFF 画面向けの明細 API。OCR 用の依存は不要なので Layer なしの軽量な Lambda にする。
+        ledger_api_fn = lambda_.Function(
+            self,
+            "LedgerApiFunction",
+            function_name=f"{prefix}-ledger-api",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="app.lambda_handlers.api_handler.lambda_handler",
+            code=lambda_.Code.from_asset(lambda_asset_path, exclude=lambda_asset_excludes),
+            timeout=Duration.seconds(15),
+            memory_size=512,
+            environment={
+                "DDB_TABLE_PREFIX": prefix,
+                "DDB_RECEIPTS_TABLE": receipts_table.table_name,
+                "DDB_FIELDS_TABLE": receipt_fields_table.table_name,
+                "DDB_SESSIONS_TABLE": sessions_table.table_name,
+                "DDB_AGGREGATE_TABLE": aggregate_entries_table.table_name,
+                "DDB_FAMILY_TABLE": family_registry_table.table_name,
+                "DDB_LEARNING_TABLE": learning_rules_table.table_name,
+                "RECEIPT_BUCKET": receipt_bucket.bucket_name,
+                "LINE_LOGIN_CHANNEL_ID": line_login_channel_id,
+            },
+        )
+        # 明細の削除で OCR 由来の領収書（項目値・セッション・原本画像）もまとめて消すため、それらへの書き込み権限を付ける
+        receipts_table.grant_read_write_data(ledger_api_fn)
+        receipt_fields_table.grant_read_write_data(ledger_api_fn)
+        sessions_table.grant_read_write_data(ledger_api_fn)
+        aggregate_entries_table.grant_read_write_data(ledger_api_fn)
+        family_registry_table.grant_read_data(ledger_api_fn)
+        # 支払先の名寄せ（「別の支払先」の記録と、次回 OCR 用の名前の対応表）を学習ルールテーブルに保存する
+        learning_rules_table.grant_read_write_data(ledger_api_fn)
+        # 領収書画像の閲覧用 URL 発行（存在確認に ListBucket も必要）と、明細削除時の画像削除
+        receipt_bucket.grant_read(ledger_api_fn)
+        receipt_bucket.grant_delete(ledger_api_fn)
+        receipt_bucket.grant_put(ledger_api_fn, "exports/*")
+
         line_webhook_api = apigwv2.HttpApi(
             self,
             "LineWebhookApi",
@@ -326,7 +380,143 @@ class MedstackHybridStack(Stack):
             ),
         )
 
+        ledger_api_integration = apigwv2_integrations.HttpLambdaIntegration(
+            "LedgerApiIntegration",
+            ledger_api_fn,
+        )
+        line_webhook_api.add_routes(
+            path="/api/{proxy+}",
+            methods=[
+                apigwv2.HttpMethod.GET,
+                apigwv2.HttpMethod.POST,
+                apigwv2.HttpMethod.PATCH,
+                apigwv2.HttpMethod.DELETE,
+            ],
+            integration=ledger_api_integration,
+        )
+
+        # --- LIFF 画面: S3 の静的ファイルと /api/* を CloudFront の同じドメインで配信（CORS 不要にする） ---
+        liff_web_bucket = s3.Bucket(
+            self,
+            "LiffWebBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+        liff_security_headers = cloudfront.ResponseHeadersPolicy(
+            self,
+            "LiffSecurityHeaders",
+            response_headers_policy_name=f"{prefix}-liff-security-headers",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    content_security_policy=(
+                        "default-src 'self'; "
+                        "script-src 'self' https://static.line-scdn.net https://*.line-scdn.net; "
+                        "connect-src 'self' https://*.line.me https://*.line-scdn.net https://*.line-apps.com; "
+                        "img-src 'self' data: https:; "
+                        "style-src 'self'; "
+                        "frame-src https://*.line.me; "
+                        "base-uri 'none'; form-action 'self'; object-src 'none'"
+                    ),
+                    override=True,
+                ),
+                content_type_options=cloudfront.ResponseHeadersContentTypeOptions(override=True),
+                frame_options=cloudfront.ResponseHeadersFrameOptions(
+                    frame_option=cloudfront.HeadersFrameOption.DENY,
+                    override=True,
+                ),
+                referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
+                    referrer_policy=cloudfront.HeadersReferrerPolicy.NO_REFERRER,
+                    override=True,
+                ),
+                strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                    access_control_max_age=Duration.days(365),
+                    include_subdomains=True,
+                    override=True,
+                ),
+            ),
+        )
+        ledger_api_origin = cloudfront_origins.HttpOrigin(
+            f"{line_webhook_api.api_id}.execute-api.{self.region}.{self.url_suffix}",
+            protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        )
+        liff_distribution = cloudfront.Distribution(
+            self,
+            "LiffDistribution",
+            comment=f"{prefix} LIFF ledger",
+            default_root_object="index.html",
+            minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+            price_class=cloudfront.PriceClass.PRICE_CLASS_200,
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(liff_web_bucket),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+                response_headers_policy=liff_security_headers,
+            ),
+            additional_behaviors={
+                "/api/*": cloudfront.BehaviorOptions(
+                    origin=ledger_api_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+                    response_headers_policy=liff_security_headers,
+                ),
+            },
+        )
+        web_asset_path = str(Path(__file__).resolve().parents[2] / "web" / "liff")
+        s3deploy.BucketDeployment(
+            self,
+            "LiffWebDeployment",
+            destination_bucket=liff_web_bucket,
+            sources=[
+                s3deploy.Source.asset(web_asset_path),
+                s3deploy.Source.json_data("config.json", {"liffId": liff_id, "apiBase": "/api"}),
+            ],
+            # 画面の更新がすぐ反映されるよう、HTML/JS/CSS はキャッシュさせない（ファイルが小さく件数も少ないため）
+            cache_control=[s3deploy.CacheControl.from_string("no-cache")],
+            distribution=liff_distribution,
+            distribution_paths=["/*"],
+        )
+
+        # --- LINE のリッチメニュー（明細を見る / 今年の医療費 / 申告資料 / 使い方） ---
+        # チャネルアクセストークンは手元に出さず、デプロイ時に Lambda が Secrets Manager から読んで登録する
+        if app_secret is not None and liff_id:
+            rich_menu_dir = Path(__file__).resolve().parent / "rich_menu"
+            rich_menu_fn = lambda_.Function(
+                self,
+                "LineRichMenuFunction",
+                function_name=f"{prefix}-line-rich-menu",
+                runtime=lambda_.Runtime.PYTHON_3_12,
+                handler="handler.on_event",
+                code=lambda_.Code.from_asset(str(rich_menu_dir), exclude=["make_image.py", "__pycache__"]),
+                timeout=Duration.seconds(90),
+                memory_size=256,
+            )
+            app_secret.grant_read(rich_menu_fn)
+            rich_menu_provider = cr.Provider(self, "LineRichMenuProvider", on_event_handler=rich_menu_fn)
+            # 画像・メニューの定義・LIFF ID が変わったときだけ登録し直す
+            rich_menu_version = hashlib.sha256(
+                (rich_menu_dir / "rich_menu.png").read_bytes()
+                + (rich_menu_dir / "handler.py").read_bytes()
+                + liff_id.encode("utf-8")
+            ).hexdigest()[:12]
+            CustomResource(
+                self,
+                "LineRichMenu",
+                service_token=rich_menu_provider.service_token,
+                properties={
+                    "SecretId": app_secrets_name,
+                    "LiffId": liff_id,
+                    "Version": rich_menu_version,
+                },
+            )
+
+        CfnOutput(self, "LiffEndpointUrl", value=f"https://{liff_distribution.distribution_domain_name}/")
         CfnOutput(self, "LineWebhookUrl", value=f"{line_webhook_api.api_endpoint}{line_webhook_path}")
+        CfnOutput(self, "LedgerApiBaseUrl", value=f"{line_webhook_api.api_endpoint}/api")
         CfnOutput(self, "LineEventsQueueUrl", value=line_events_queue.queue_url)
         CfnOutput(self, "ReceiptBucketName", value=receipt_bucket.bucket_name)
         CfnOutput(self, "FamilyRegistryTableName", value=family_registry_table.table_name)

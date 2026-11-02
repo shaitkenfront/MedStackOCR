@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>医療費の明細</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js" charset="utf-8" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>医療費の明細</h1>
+    <label class="year-picker">
+      <span class="visually-hidden">対象の年</span>
+      <select id="year-select" aria-label="対象の年"></select>
+    </label>
+  </header>
+
+  <main id="app" aria-busy="true">
+    <p id="status-message" class="status" role="status">読み込み中です…</p>
+
+    <section id="summary" class="summary" hidden aria-label="集計">
+      <div class="summary-main">
+        <span class="summary-label">支払った医療費</span>
+        <span class="summary-value" id="summary-total">0円</span>
+      </div>
+      <dl class="summary-grid">
+        <div><dt>補填される金額</dt><dd id="summary-reimbursed">0円</dd></div>
+        <div><dt>差引額</dt><dd id="summary-net">0円</dd></div>
+        <div><dt>明細の件数</dt><dd id="summary-count">0件</dd></div>
+        <div><dt>未確定</dt><dd id="summary-unconfirmed">0件</dd></div>
+      </dl>
+      <p class="summary-note">医療費控除の対象になるのは、差引額から10万円（総所得金額等が200万円未満の人はその5%）を引いた額です。</p>
+      <button type="button" class="primary export-button" id="export-open">確定申告用の資料（Excel）を作る</button>
+    </section>
+
+    <nav class="tabs" id="tabs" hidden role="tablist">
+      <button type="button" role="tab" id="tab-entries" aria-selected="true" aria-controls="panel-entries">明細一覧</button>
+      <button type="button" role="tab" id="tab-checks" aria-selected="false" aria-controls="panel-checks">
+        チェック<span class="tab-badge" id="checks-badge" hidden></span>
+      </button>
+      <button type="button" role="tab" id="tab-providers" aria-selected="false" aria-controls="panel-providers">
+        支払先<span class="tab-badge" id="providers-badge" hidden></span>
+      </button>
+    </nav>
+
+    <section id="panel-entries" role="tabpanel" aria-labelledby="tab-entries" hidden>
+      <div class="toolbar">
+        <select id="member-filter" aria-label="医療を受けた人で絞り込む">
+          <option value="">全員</option>
+        </select>
+        <label class="toggle">
+          <input type="checkbox" id="issues-only"> 要確認のみ
+        </label>
+      </div>
+      <p class="filter-chip" id="provider-filter-chip" hidden>
+        <span id="provider-filter-label"></span>
+        <button type="button" id="provider-filter-clear" aria-label="支払先の絞り込みを解除">✕</button>
+      </p>
+      <ul class="entry-list" id="entry-list"></ul>
+      <p class="empty" id="entries-empty" hidden>この年の明細はまだありません。</p>
+    </section>
+
+    <section id="panel-checks" role="tabpanel" aria-labelledby="tab-checks" hidden>
+      <p class="check-lead" id="check-lead"></p>
+      <ul class="issue-list" id="issue-list"></ul>
+    </section>
+
+    <section id="panel-providers" role="tabpanel" aria-labelledby="tab-providers" hidden>
+      <h2 class="section-title">表記ゆれの候補</h2>
+      <p class="section-lead" id="groups-lead"></p>
+      <div class="group-list" id="group-list"></div>
+      <h2 class="section-title">すべての支払先</h2>
+      <p class="section-lead">名前をタップすると、その支払先の明細を表示します。</p>
+      <ul class="provider-list" id="provider-list"></ul>
+    </section>
+  </main>
+
+  <button type="button" class="fab" id="add-button" hidden>＋ 手入力で追加</button>
+
+  <dialog id="entry-dialog" aria-labelledby="dialog-title">
+    <form id="entry-form" method="dialog" novalidate>
+      <h2 id="dialog-title">明細の編集</h2>
+      <p class="dialog-hint" id="dialog-hint"></p>
+      <div class="receipt-image" id="receipt-image-area" hidden>
+        <button type="button" id="receipt-image-button">領収書の画像を見る</button>
+        <p class="field-help" id="receipt-image-message" role="status"></p>
+        <img id="receipt-image" alt="LINEで送った領収書の画像" hidden>
+      </div>
+
+      <label class="field">
+        <span>支払日</span>
+        <input type="date" name="service_date" required>
+        <small class="field-error" data-error-for="service_date"></small>
+      </label>
+      <label class="field">
+        <span>病院・薬局などの支払先</span>
+        <input type="text" name="provider_name" maxlength="100" required autocomplete="off" list="provider-options">
+        <datalist id="provider-options"></datalist>
+        <span class="suggestion" id="provider-suggestion" hidden>
+          <span id="provider-suggestion-text"></span>
+          <button type="button" id="provider-suggestion-apply">そろえる</button>
+        </span>
+        <small class="field-error" data-error-for="provider_name"></small>
+      </label>
+      <label class="bulk-option" id="bulk-rename-row" hidden>
+        <input type="checkbox" id="bulk-rename">
+        <span id="bulk-rename-label"></span>
+      </label>
+      <label class="field">
+        <span>医療を受けた人</span>
+        <input type="text" name="family_member_name" maxlength="50" list="family-options" required autocomplete="off">
+        <datalist id="family-options"></datalist>
+        <small class="field-error" data-error-for="family_member_name"></small>
+      </label>
+      <label class="field">
+        <span>医療費の区分</span>
+        <select name="medical_category"></select>
+        <small class="field-error" data-error-for="medical_category"></small>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span>支払った金額（円）</span>
+          <input type="text" name="amount_yen" inputmode="numeric" required autocomplete="off">
+          <small class="field-error" data-error-for="amount_yen"></small>
+        </label>
+        <label class="field">
+          <span>補填される金額（円）</span>
+          <input type="text" name="reimbursed_yen" inputmode="numeric" autocomplete="off" placeholder="0">
+          <small class="field-error" data-error-for="reimbursed_yen"></small>
+        </label>
+      </div>
+      <p class="field-help">補填される金額：保険金や高額療養費など、あとで戻ってくるお金。</p>
+      <label class="field">
+        <span>メモ</span>
+        <textarea name="note" rows="2" maxlength="500" placeholder="例：自宅→〇〇病院 バス往復"></textarea>
+        <small class="field-error" data-error-for="note"></small>
+      </label>
+      <label class="field">
+        <span>状態</span>
+        <select name="status">
+          <option value="confirmed">確定</option>
+          <option value="hold">保留</option>
+        </select>
+        <small class="field-error" data-error-for="status"></small>
+      </label>
+      <p class="form-error" id="form-error" role="alert"></p>
+
+      <div class="dialog-actions">
+        <button type="button" class="danger" id="delete-button">削除</button>
+        <span class="spacer"></span>
+        <button type="button" id="cancel-button">キャンセル</button>
+        <button type="submit" class="primary" id="save-button">保存</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="export-dialog" aria-labelledby="export-title">
+    <form id="export-form" method="dialog" novalidate>
+      <h2 id="export-title">確定申告用の資料</h2>
+      <p class="dialog-hint">国税庁の「医療費集計フォーム」（Excel）に、この年の明細を書き込みます。確定申告書等作成コーナーで読み込めます。</p>
+      <p class="status" id="export-status" role="status"></p>
+      <dl class="summary-grid export-summary" id="export-summary" hidden>
+        <div><dt>資料に載せる明細</dt><dd id="export-count"></dd></div>
+        <div><dt>支払った医療費</dt><dd id="export-total"></dd></div>
+        <div><dt>補填される金額</dt><dd id="export-reimbursed"></dd></div>
+        <div><dt>差引額</dt><dd id="export-net"></dd></div>
+      </dl>
+      <ul class="export-notes" id="export-notes"></ul>
+      <div class="export-result" id="export-result" hidden>
+        <p>資料を作成しました。リンクの有効期限は10分です。</p>
+        <a class="button primary" id="export-download" href="#" download>ダウンロード</a>
+        <button type="button" id="export-external">ブラウザで開いてダウンロード</button>
+        <p class="field-help">LINEの画面からダウンロードできないときは、「ブラウザで開いてダウンロード」を押してください。</p>
+      </div>
+      <details class="export-help">
+        <summary>作成コーナーでの読み込み方</summary>
+        <ol>
+          <li>確定申告書等作成コーナーの「控除の入力」で「医療費控除」を選ぶ</li>
+          <li>「医療費控除」を選んで「次へ」を押す</li>
+          <li>「医療費集計フォームを利用する」を選び、「集計フォーム読込画面へ」を押す</li>
+          <li>ダウンロードしたファイルを選び、「選択したファイルを読み込む」を押す</li>
+        </ol>
+        <p class="field-help">セルフメディケーション税制を使う場合は、このフォームは使えません。読み込んだあとは、内容が正しく反映されているか必ず確認してください。</p>
+      </details>
+      <p class="form-error" id="export-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" id="export-checks">チェックを見る</button>
+        <span class="spacer"></span>
+        <button type="button" id="export-cancel">閉じる</button>
+        <button type="submit" class="primary" id="export-create">Excelファイルを作成</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="rename-dialog" aria-labelledby="rename-title">
+    <form id="rename-form" method="dialog" novalidate>
+      <h2 id="rename-title">支払先の名前をまとめて直す</h2>
+      <p class="dialog-hint" id="rename-hint"></p>
+      <label class="field">
+        <span>正しい名前</span>
+        <input type="text" name="to_name" maxlength="100" list="provider-options" autocomplete="off" required>
+      </label>
+      <fieldset class="merge-list" id="rename-merge-fieldset">
+        <legend>ほかの名前もこの名前にまとめる（任意）</legend>
+        <div id="rename-merge-options"></div>
+      </fieldset>
+      <div class="receipt-image" id="rename-image-area" hidden>
+        <button type="button" id="rename-image-button">この支払先の領収書を見る</button>
+        <p class="field-help" id="rename-image-message" role="status"></p>
+        <img id="rename-image" alt="LINEで送った領収書の画像" hidden>
+      </div>
+      <p class="form-error" id="rename-error" role="alert"></p>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="rename-cancel">キャンセル</button>
+        <button type="submit" class="primary" id="rename-save">まとめて変更</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

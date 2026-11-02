@@ -16,6 +16,7 @@ from app.pipeline import ReceiptExtractionPipeline
 from core.enums import FieldName
 from inbox.aggregate_service import AggregateService
 from inbox.conversation_service import ConversationService
+from inbox.ocr_archive import archive_path_for, build_ocr_archive
 from inbox.repository_factory import create_inbox_repository
 from inbox.state_machine import STATE_AWAIT_FREE_TEXT
 from linebot import message_templates
@@ -104,7 +105,7 @@ class LineEventWorker:
 
         timeout_sec = float(self.line_conf.get("timeout_sec", 10))
         self.repository = create_inbox_repository(config)
-        self.aggregate_service = AggregateService(self.repository)
+        self.aggregate_service = AggregateService(self.repository, liff_id=os.getenv("LIFF_ID", ""))
         self.conversation_service = ConversationService(
             repository=self.repository,
             session_ttl_minutes=int(self.inbox_conf.get("session_ttl_minutes", 60)),
@@ -272,6 +273,7 @@ class LineEventWorker:
                     household_id=self.default_household_id,
                     ocr_engine=engine_name,
                     family_registry_override=family_registry_override,
+                    known_provider_names=self._known_provider_names(line_user_id),
                 )
             except OCRAdapterError as exc:
                 print(f"ocr-adapter-error line_user_id={line_user_id} message_id={message_id} error={exc}")
@@ -281,6 +283,7 @@ class LineEventWorker:
                     messages=message_templates.build_ocr_unavailable_message(),
                 )
                 return
+            self._persist_ocr_archive(image_path=image_path, receipt_id=receipt_id, result=result)
             extracted_fields = _fields_from_result(result)
             duplicate_key = _build_duplicate_key(extracted_fields)
             duplicates = self.repository.find_potential_duplicates(
@@ -385,10 +388,47 @@ class LineEventWorker:
                 deleted += 1
         print(f"user-data-purged line_user_id={line_user_id} records_images={len(image_paths)} deleted_images={deleted}")
 
+    def _known_provider_names(self, line_user_id: str) -> list[str]:
+        """利用者が確定した支払先の名前。医療機関名の抽出で「よく行く医療機関」として使う。"""
+        try:
+            rows = self.repository.list_ledger_rows(line_user_id)
+        except Exception as exc:  # 取得に失敗しても OCR は続ける
+            print(f"known-provider-names-failed error={exc}")
+            return []
+        names: list[str] = []
+        for row in rows:
+            name = str(row.get("provider_name") or "").strip()
+            if name and str(row.get("status") or "") == "confirmed" and name not in names:
+                names.append(name)
+        return names
+
+    def _persist_ocr_archive(self, *, image_path: str, receipt_id: str, result: Any) -> None:
+        """OCR で読んだ行を画像の隣に保存する。失敗しても領収書の処理は止めない。"""
+        archive_path = archive_path_for(image_path)
+        if not archive_path:
+            return
+        try:
+            body = json.dumps(build_ocr_archive(receipt_id, result), ensure_ascii=False).encode("utf-8")
+            if archive_path.startswith("s3://"):
+                bucket, key = _parse_s3_uri(archive_path)
+                if not bucket or not key or self._s3_client is None:
+                    return
+                self._s3_client.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=body,
+                    ContentType="application/json; charset=utf-8",
+                )
+            else:
+                Path(archive_path).write_bytes(body)
+        except Exception as exc:
+            print(f"ocr-archive-save-failed receipt_id={receipt_id} error={exc}")
+
     def _delete_stored_image(self, image_path: str) -> bool:
         path_text = str(image_path or "").strip()
         if not path_text:
             return False
+        self._delete_ocr_archive(path_text)
 
         if path_text.startswith("s3://"):
             bucket, key = _parse_s3_uri(path_text)
@@ -400,6 +440,18 @@ class LineEventWorker:
         local_path = Path(path_text)
         local_path.unlink(missing_ok=True)
         return True
+
+    def _delete_ocr_archive(self, image_path: str) -> None:
+        archive_path = archive_path_for(image_path)
+        try:
+            if archive_path.startswith("s3://"):
+                bucket, key = _parse_s3_uri(archive_path)
+                if bucket and key and self._s3_client is not None:
+                    self._s3_client.delete_object(Bucket=bucket, Key=key)
+            elif archive_path:
+                Path(archive_path).unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"ocr-archive-delete-failed error={exc}")
 
     def _handle_duplicate_postback(self, *, line_user_id: str, data: str) -> list[dict[str, Any]] | None:
         params = _parse_postback_data(data)
