@@ -32,17 +32,32 @@ class ReceiptExtractionPipeline:
         self.classifier = DocumentClassifier()
         self.facility_extractor = FacilityExtractor()
         self.date_extractor = DateExtractor()
-        self.amount_extractor = AmountExtractor()
+        documentai_tuning = (
+            config.get("ocr", {})
+            .get("engines", {})
+            .get("documentai", {})
+            .get("amount_tuning", {})
+        )
+        self.amount_extractor = AmountExtractor(documentai_tuning=documentai_tuning)
         self.family_name_extractor = FamilyNameExtractor(config.get("family_registry"))
         self.resolver = resolver_from_config(config)
         self.normalizer = OCRNormalizer()
         self.audit_logger = AuditLogger()
 
-    def process(self, image_path: str, household_id: str | None, ocr_engine: str) -> ExtractionResult:
+    def process(
+        self,
+        image_path: str,
+        household_id: str | None,
+        ocr_engine: str,
+        family_registry_override: dict[str, Any] | None = None,
+    ) -> ExtractionResult:
         adapter = create_ocr_adapter(ocr_engine, self.config)
         raw = adapter.run(image_path)
         image_size = get_image_size(image_path)
         lines = self.normalizer.normalize(raw=raw, image_size=image_size)
+        family_name_extractor = self.family_name_extractor
+        if family_registry_override is not None:
+            family_name_extractor = FamilyNameExtractor(family_registry_override)
 
         document_type, _, classifier_reasons, ocr_quality = self.classifier.classify(lines)
         template_match = TemplateMatch(matched=False, template_family_id=None, score=0.0, reasons=["template_not_checked"])
@@ -63,8 +78,10 @@ class ReceiptExtractionPipeline:
         }
         self._merge_candidate_pool(candidate_pool, self.facility_extractor.extract(document_type, lines))
         candidate_pool[FieldName.PAYMENT_DATE].extend(self.date_extractor.extract(lines))
-        candidate_pool[FieldName.PAYMENT_AMOUNT].extend(self.amount_extractor.extract(lines))
-        candidate_pool[FieldName.FAMILY_MEMBER_NAME].extend(self.family_name_extractor.extract(lines))
+        candidate_pool[FieldName.PAYMENT_AMOUNT].extend(
+            self.amount_extractor.extract(lines, ocr_engine=raw.engine)
+        )
+        candidate_pool[FieldName.FAMILY_MEMBER_NAME].extend(family_name_extractor.extract(lines))
 
         if matched_template is not None:
             template_candidates = self.template_matcher.apply_template(matched_template, lines)
@@ -137,7 +154,9 @@ class ReceiptExtractionPipeline:
         if family_member.source == "family_registry_unknown_surname":
             if "family_name_not_in_registry_different_surname" not in reasons:
                 reasons.append("family_name_not_in_registry_different_surname")
-            return Decision(status=DecisionStatus.REJECTED, confidence=decision.confidence, reasons=reasons)
+            if decision.status == DecisionStatus.REJECTED:
+                return decision
+            return Decision(status=DecisionStatus.REVIEW_REQUIRED, confidence=decision.confidence, reasons=reasons)
 
         if family_member.source == "family_registry_same_surname" and decision.status != DecisionStatus.REJECTED:
             if "family_name_not_in_registry_same_surname" not in reasons:

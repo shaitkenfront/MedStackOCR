@@ -26,6 +26,12 @@ data/templates/**
 data/outputs/**
 !data/outputs/
 !data/outputs/review_fix.example.json
+data/inbox/images/**
+!data/inbox/
+!data/inbox/images/
+!data/inbox/images/.gitkeep
+*.db
+*.sqlite3
 
 # Large local resources
 data/tessdata/*.traineddata
@@ -35,3 +41,9 @@ scripts/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# CDK local context (contains secrets)
+infra/cdk/cdk.context.json
+infra/cdk/cdk.out/
+infra/cdk/layers/docai/python/**
+!infra/cdk/layers/docai/python/.gitkeep

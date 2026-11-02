@@ -1,34 +1,48 @@
 # family_registry 運用手順
 
 ## 1. 事前準備
-- `family_registry.template.yaml` を開く。
-- `canonical_name` は正規表記（例: `山田 太郎`）で統一する。
-- `aliases` には OCR の誤認識や表記ゆれを登録する。
+- 家族氏名辞書は LINEユーザーID ごとに DynamoDB へ保存される。
+- 友だち追加（`follow`）時に、家族氏名登録フローを開始する。
 
 ## 2. 登録ルール
-- すべての家族を `members` に登録する（必須）。
-- `aliases` には次を優先して追加する。
-  - スペース有無（`山田太郎` / `山田 太郎`）
-  - 敬称付き（`山田 太郎様`）
-  - カナ表記（`ヤマダ タロウ`）
-  - よく出る誤読（例: `ヤマダ` -> `ヤマタ`）
+- すべての家族を 1名ずつ登録する（最低1名必須）。
+- カンマ区切り入力は使わず、会話をステップ入力で進める。
+  1. 氏名を入力（例: `山田 太郎`）
+  2. ヨミガナを入力（例: `ヤマダ タロウ`）
+  3. よく間違えられる表記を任意で入力（なければ `該当なし`）
+- 氏名・ヨミガナは姓と名の間にスペース必須（全角/半角どちらでも可）。
+  - スペース未入力時は丁寧な再入力メッセージを返す。
+- 別表記は自動で重複排除し、代表表記（`canonical_name`）と同一値は除外する。
 
-## 3. 設定反映
-- `config.yaml` の `family_registry` をテンプレート内容で更新する。
-- `required: true` のまま運用する。
+## 3. 登録完了
+- 1名登録ごとにクイックリプライを提示する。
+  - `次の名前の入力に進む`
+  - `名前登録を終了する`
+- 登録完了前は通常のOCR処理には進まない。
 
 ## 4. 判定仕様（現行）
 - 辞書一致（`canonical_name` または `aliases` 一致）: 通常判定
-- 未登録だが同姓: `REVIEW_REQUIRED`
-- 未登録かつ異姓: `REJECTED`
+- 未登録（同姓/異姓を問わない）: `REVIEW_REQUIRED`
 
-## 5. 日次運用フロー
-1. バッチ実行: `python -m app.main batch --config config.yaml --input-dir data/samples --household-id household_demo --output-dir data/outputs/yomitoku_tuned`
-2. `REVIEW_REQUIRED` / `REJECTED` の `family_member_name` と `decision.reasons` を確認
-3. 正当な家族なら `aliases` を追加して再実行
-4. 他姓ノイズなら辞書追加せずそのまま `REJECTED` を維持
+## 5. `REVIEW_REQUIRED` 時の氏名確認フロー
+1. 登録候補の確認メッセージを表示する。
+2. 登録済み家族氏名をクイックリプライで提示する。
+3. クイックリプライには `新しい家族を追加` を含める。
+4. 既存家族を選択した場合:
+   - 選択した氏名で `family_member_name` を更新する。
+   - OCR誤読の元文字列を、選択先家族の `aliases` に自動追加する。
+5. `新しい家族を追加` を選択した場合:
+   - 家族氏名登録フローに一時分岐する。
+   - `名前登録を終了する` 後に、元の確認フローへ戻って候補選択を続行する。
 
-## 6. メンテナンスの目安
+## 6. 日次運用フロー
+1. LINE Developers の Webhook URL を AWS API Gateway（CDK出力 `LineWebhookUrl`）に設定
+2. LINEで領収書画像を送信
+3. `REVIEW_REQUIRED` の `family_member_name` と `decision.reasons` を確認
+4. 正当な家族なら、候補選択または `新しい家族を追加` で辞書を更新
+5. ノイズ判定なら `保留` で止める（必要に応じて後で見直し）
+
+## 7. メンテナンスの目安
 - 1名につき最低3〜5個の `aliases` を持つ
 - 新しいOCRエンジン・帳票形式を追加したら aliases を再点検する
 - 誤検出が続く場合は `aliases` 追加を優先し、抽出ロジック変更は最後に検討する

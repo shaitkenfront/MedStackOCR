@@ -1,167 +1,66 @@
 # MedStackOCR MVP
 
-医療費控除向け領収書抽出エンジンの MVP 実装です。
+医療費控除向けの領収書OCR・整理システムです。  
+このブランチは **LINE Webhook + AWS Lambda 本番運用専用** です。
 
-## 主要機能
-- 施設名・日付・金額抽出
-- 家族氏名抽出（家族辞書 + alias 対応）
-- Resolver による `AUTO_ACCEPT` / `REVIEW_REQUIRED` / `REJECTED`
-- 監査情報出力（根拠 `reasons` を保持）
-- 世帯ローカルテンプレート（保存・一致・学習）
-- CLI: `extract` / `batch` / `compare-ocr` / `learn-template`
-- 評価スクリプト（`evaluation.eval_runner`）
+## 概要
+- LINEで受けた領収書画像を Google Document AI でOCR
+- 抽出項目: 医療機関 / 日付 / 金額 / 対象者
+- 判定: `AUTO_ACCEPT` / `REVIEW_REQUIRED` / `REJECTED`
+- 支払日年チェック: システム日付基準で「当年または前年」を許容
+- 会話型修正フローと累計医療費集計を提供
 
-## クイックスタート
-```bash
-pip install -r requirements-ocr-optional.txt
-```
+## 構成
+- API Gateway (HTTP API)
+- Lambda (Ingress / Worker の2段)
+- SQS FIFO
+- DynamoDB
+- S3（原本画像）
+- Google Document AI（OCR）
 
-公開運用の推奨:
-- `config.example.yaml` をコピーして `config.yaml` を作成し、家族氏名・APIキー等をローカルで設定
-- `config.yaml` / `data/templates/` は `.gitignore` 対象（個人情報・学習済みテンプレートの混入防止）
+主要実装:
+- `app/lambda_handlers/ingress_handler.py`
+- `app/lambda_handlers/worker_handler.py`
+- `infra/cdk/`
 
-`config.yaml` 既定では `ocr.allowed_engines: [yomitoku]` のため、`--ocr-engine` に他エンジンを指定するとエラーになります。
-`yomitoku` は、CUDA が使えない環境では自動で CPU にフォールバックします。強制的に CPU 実行したい場合は `--force-cpu` を指定してください。
-`--household-id` は任意です（指定時のみテンプレート照合に利用）。
+## 主な機能
+- 家族氏名登録（LINEユーザー単位、alias対応）
+- OCR結果の確認・修正・確定
+- 重複候補検知（画像ハッシュ / 項目一致）
+- 訂正履歴に基づく学習ヒント
+- 控除対象外の可能性キーワード検知（注意喚起）
+- ブロック時（`unfollow`）のユーザーデータ削除
 
-`family_registry` は必須です。`members` に家族氏名（`canonical_name`）と OCR 揺れ向けの `aliases` を登録してください。
-未登録氏名を検出した場合は以下で判定します。
-- 同姓: `REVIEW_REQUIRED`
-- 異姓: `REJECTED`
+## いたずら利用対策
+- OCR実行前に同一画像ハッシュをチェック
+- OCR実行レート制限（既定値）
+  - ユーザー: `3件/分`
+  - ユーザー: `40件/日`
+  - 全体: `1200件/日`
+- 制限超過時はDocAIを呼ばず、LINEに案内メッセージを返却
 
-テンプレートと運用手順:
-- `family_registry.template.yaml`
-- `docs/family_registry_guide.md`
+## 設定
+- 機密値（LINEトークン / DocAI認証情報）は Secrets Manager で管理します。
+- 非機密値は CDK context と Lambda環境変数で管理します。
 
-年整合チェック（`batch` 実行時）:
-- `pipeline.target_tax_year` を指定した場合: `payment_date.year` が一致しない明細を `REVIEW_REQUIRED`
-- 未指定の場合: 同一バッチ内で最多年（重み付き多数決）を推定し、外れ年を `REVIEW_REQUIRED`
-- 設定は `pipeline.year_consistency`（`enabled`, `min_samples`, `dominant_ratio_threshold`, `weight_by_confidence`）
+## デプロイ
+- デプロイ手順は `infra/cdk/README.md` を参照してください。
 
-`batch` の出力:
-- `summary.json`: 当回実行の処理結果（`SKIPPED_ALREADY_PROCESSED` を含む）
-- `summary.csv`: 全 `*.result.json` から再生成する4項目サマリ（`日付`,`氏名`,`医療機関・調剤薬局名`,`金額`）
-- `processed_files.json`: 処理済み画像の管理ファイル（サイズ + 更新時刻）
-  - 2回目以降は `processed_files.json` と一致する画像をスキップし、未処理ファイルのみ実行
-- `--target-dir`: 入力画像（`*.jpg` など）と出力ファイル（`*.result.json`, `summary.*`）を同じフォルダで管理
+## LINE操作
+テキストコマンド:
+- `今年の医療費`
+- `今月の医療費`
+- `未確認`
+- `ヘルプ`
+- `取り消し`（類義語: 取消 / やり直し / 削除 / 失敗）
 
-通知（`batch` 実行時に新規追加領収書を検知）:
-- 通知先は `notifications.channels` で選択（`line`, `slack`, `discord`）
-- 実際の送信処理は抽象化されており、本体ロジックと疎結合
-- `processed_files.json` に未登録の画像がある場合のみ通知
-
-```yaml
-notifications:
-  enabled: true
-  channels: [slack, discord]  # line/slack/discord から選択
-  max_items_in_message: 10
-  slack:
-    webhook_url: "https://hooks.slack.com/services/..."
-  discord:
-    webhook_url: "https://discord.com/api/webhooks/..."
-  line:
-    channel_access_token: "YOUR_LINE_CHANNEL_ACCESS_TOKEN"
-    to: "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-```
-
-```bash
-python -m app.main extract \
-  --config config.yaml \
-  --image data/samples/pharmacy_receipt.jpg \
-  --household-id household_demo  # 任意 \
-  --force-cpu \
-  --output data/outputs/pharmacy_result.json
-```
-
-```bash
-python -m app.main batch \
-  --config config.yaml \
-  --household-id household_demo  # 任意 \
-  --force-cpu \
-  --target-dir data/samples
-```
-
-```bash
-python -m app.main refresh-summary \
-  --config config.yaml \
-  --target-dir data/outputs/yomitoku_tuned
-```
-
-```bash
-python -m app.main compare-ocr \
-  --config config.yaml \
-  --image data/samples/pharmacy_receipt.jpg \
-  --household-id household_demo  # 任意 \
-  --ocr-engines yomitoku \
-  --force-cpu \
-  --target-dir data/outputs/compare
-```
-
-```bash
-python -m app.main healthcheck-ocr \
-  --config config.yaml \
-  --ocr-engines yomitoku \
-  --force-cpu
-```
-
-```bash
-python -m app.main learn-template \
-  --config config.yaml \
-  --document-result data/outputs/pharmacy_result.json \
-  --review-correction data/outputs/review_fix.example.json
-```
-
-```bash
-python -m evaluation.eval_runner \
-  --pred-dir data/outputs \
-  --gt-dir data/ground_truth \
-  --output data/outputs/metrics.json
-```
+## 初回オンボーディング
+- `follow` イベントで家族氏名登録を開始
+- ステップ入力: 氏名 -> ヨミガナ -> 誤表記（任意）
+- クイックリプライ: `次の名前の入力に進む` / `名前登録を終了する`
+- 登録完了まで通常OCR処理に進まない
 
 ## テスト
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
-```
-
-## エンジン別メモ
-- `tesseract`: Windows の場合 `C:\Program Files\Tesseract-OCR\tesseract.exe` を既定参照。日本語用に `data/tessdata/jpn.traineddata` を参照。
-- `paddle`: `paddleocr` + `paddlepaddle` が必要。GPU利用時は CUDA 対応ビルドが必要。
-- `yomitoku`: 画像は OpenCV で読み込み。`device: cuda` でも CUDA 非対応 Torch の場合は CPU fallback。
-- `deepseek`: `backend: api|local` を選択可能。
-  - `api`: `DS_OCR_API_KEY` が必要（`deepseek-ocr` パッケージ経由）。
-  - `local`: `torch` + `transformers` が必要（`deepseek-ai/DeepSeek-OCR` をローカル推論）。
-
-`config.yaml` 例（ローカル推論）:
-```yaml
-ocr:
-  engines:
-    deepseek:
-      enabled: true
-      backend: local
-      model_name: deepseek-ai/DeepSeek-OCR
-      local_prompt: "<image>\nFree OCR."
-      local_base_size: 512
-      local_image_size: 512
-      local_crop_mode: false
-      local_device: cuda
-      local_dtype: bfloat16
-      local_attn_impl: eager
-```
-
-## Paddle 再検証 (Python 3.12)
-以下の固定構成で動作確認済み（CPU実行）:
-- `paddlepaddle==3.2.2`
-- `paddleocr==3.3.3`
-
-※この検証を行う場合は、一時的に `config.yaml` の `ocr.allowed_engines` に `paddle` を追加してください。
-
-```bash
-D:\\ProgramData\\Anaconda\\python.exe -m venv .venv-py312-paddle
-.venv-py312-paddle\\Scripts\\python.exe -m pip install -r requirements-paddle-py312.txt
-.venv-py312-paddle\\Scripts\\python.exe -m app.main extract \
-  --config config.yaml \
-  --image data/samples/clinic_receipt.jpg \
-  --household-id household_demo  # 任意 \
-  --ocr-engine paddle \
-  --output data/outputs/clinic_paddle_py312.json
 ```

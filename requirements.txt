@@ -1,7 +1,7 @@
 # Base dependencies
 PyYAML==6.0.2
 chardet==5.2.0
+boto3>=1.34.0
 
 # OCR engine dependencies
-opencv-python
--r requirements-ocr-optional.txt
+google-cloud-documentai>=2.30.0
